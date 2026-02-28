@@ -10,6 +10,10 @@ function stripExt(name: string) {
 function idemKey(prefix: string) {
   return `${prefix}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
 }
+function toNum(v: any) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 
 function buildAdminHeaders(contentType?: string, idem?: string): Headers {
   const cfg = getBackendConfig() || ensureBackendConfigOnce();
@@ -20,11 +24,6 @@ function buildAdminHeaders(contentType?: string, idem?: string): Headers {
   if (contentType) h.set("Content-Type", contentType);
   if (idem) h.set("Idempotency-Key", idem);
   return h;
-}
-
-function toNum(v: any) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
 }
 
 export default function ImportPage() {
@@ -96,19 +95,20 @@ export default function ImportPage() {
       const canCommit = !!(validateRes?.can_commit ?? validateRes?.data?.can_commit);
       const validRows = toNum(validateRes?.valid_rows ?? validateRes?.data?.valid_rows);
 
-      if (!canCommit || validRows <= 0) {
+      // ✅ 关键：后端 validate 明确返回 batch_id
+      const batchId: string = String(validateRes?.batch_id ?? validateRes?.data?.batch_id ?? "");
+
+      if (!canCommit || validRows <= 0 || !batchId) {
         await rollbackReceipt(receiptId);
         showToast("导入错误，请调整表格内标题");
         return;
       }
 
-      // 3) commit
-      // ✅ 修复点：后端若用 req.json()，空 body 会报 “Unexpected end of JSON input”
-      // ✅ 所以这里明确发送 {} 并设置 Content-Type
+      // 3) commit（✅ 必须带 batch_id）
       const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
         method: "POST",
         headers: buildAdminHeaders("application/json", idemKey("commit")),
-        body: JSON.stringify({}),
+        body: JSON.stringify({ batch_id: batchId }),
       });
 
       // ✅ 兼容后端真实返回结构：{ receipt, imported_items, batch: { status:"committed" } }
