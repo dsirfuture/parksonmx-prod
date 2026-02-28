@@ -30,7 +30,7 @@ function toNum(v: any) {
 export default function ImportPage() {
   const navigate = useNavigate();
   const [toast, setToast] = useState<string | null>(null);
-  const [pickedName, setPickedName] = useState<string>(""); // 只显示文件名
+  const [pickedName, setPickedName] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
   const showToast = (msg: string) => {
@@ -103,16 +103,15 @@ export default function ImportPage() {
       }
 
       // 3) commit
+      // ✅ 修复点：后端若用 req.json()，空 body 会报 “Unexpected end of JSON input”
+      // ✅ 所以这里明确发送 {} 并设置 Content-Type
       const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
         method: "POST",
-        headers: buildAdminHeaders(undefined, idemKey("commit")),
+        headers: buildAdminHeaders("application/json", idemKey("commit")),
+        body: JSON.stringify({}),
       });
 
-      /**
-       * ✅ 兼容后端真实返回结构：
-       * - 新结构：{ receipt, imported_items, batch: { status: "committed" } }
-       * - 旧结构：{ ok: true } / { success: true } / { data: { ok: true } }
-       */
+      // ✅ 兼容后端真实返回结构：{ receipt, imported_items, batch: { status:"committed" } }
       const batchStatus =
         commitRes?.batch?.status ??
         commitRes?.data?.batch?.status ??
@@ -174,7 +173,6 @@ export default function ImportPage() {
           返回看板
         </button>
 
-        {/* ✅ 版权：与其他页一致，只出现一次 */}
         <div className="py-4 text-center">
           <p className="text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</p>
         </div>
