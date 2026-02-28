@@ -1,8 +1,7 @@
-// src/http.ts
-// ✅ 目标：确保所有请求都稳定带上 X-User-Id（解决你现在的 401 unauthenticated）
-// ✅ 同时保持你已修复的：请求打到 https://parksonmx.vercel.app（避免打到 localhost）
+// src/api/http.ts
+// ✅ 目标：确保所有请求都稳定带上 X-User-Id（解决 401 unauthenticated）
+// ✅ 同时保持请求打到 https://parksonmx.vercel.app（避免打到 localhost）
 // ✅ 仍用 new Headers().set(...) 逐条设置，避免“非法字符 headers”
-
 export type ApiFetchOptions = RequestInit & {
   baseUrl?: string;
   debugAuth?: boolean; // 开发期诊断用
@@ -27,9 +26,9 @@ function toAbsoluteUrl(input: string, baseUrl?: string) {
 
 /**
  * 兼容读取 user_id：
- * - psmx_user_id（我们建议的）
+ * - psmx_user_id（建议）
  * - parksonmx:user_id / user_id（历史）
- * - ADMIN_ID / WORKER_ID（你 console 页面展示的 id，很多人会直接存这个 key）
+ * - ADMIN_ID / WORKER_ID（有人会直接存这个 key）
  */
 function readUserId() {
   return (
@@ -55,7 +54,7 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
   const userId = readUserId();
   if (userId && !h.has("X-User-Id")) h.set("X-User-Id", userId);
 
-  // Share 场景可选
+  // Share 场景可选（customer token 通常只读）
   const shareToken =
     localStorage.getItem("psmx_share_token") ||
     localStorage.getItem("parksonmx:share_token") ||
@@ -66,9 +65,10 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
   if (!h.has("Accept")) h.set("Accept", "application/json");
 
   if (debugAuth) {
-    // 仅开发诊断：你能立刻看到有没有带上 X-User-Id
     // eslint-disable-next-line no-console
     console.log("[apiFetch] X-User-Id =", h.get("X-User-Id"));
+    // eslint-disable-next-line no-console
+    console.log("[apiFetch] X-Share-Token =", h.get("X-Share-Token"));
   }
 
   return h;
@@ -89,9 +89,7 @@ export async function apiFetch<T = any>(
   options: ApiFetchOptions = {}
 ): Promise<T> {
   const abs = toAbsoluteUrl(url, options.baseUrl);
-
   const headers = buildHeaders(options.headers, options.debugAuth);
-
   const { baseUrl, debugAuth, ...rest } = options;
 
   const res = await fetch(abs, {
@@ -105,7 +103,6 @@ export async function apiFetch<T = any>(
       (payload?.error?.message as string) ||
       (payload?.message as string) ||
       `HTTP_${res.status}`;
-
     const err: any = new Error(msg);
     err.status = res.status;
     err.payload = payload;
