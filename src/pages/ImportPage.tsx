@@ -98,12 +98,42 @@ export default function ImportPage() {
       }
 
       // 3) commit
+      // ✅ 关键修复：commit 必须发送 JSON body，否则后端 req.json() 会报 “Unexpected end of JSON input”
+      // 同时尽可能把 validate 返回的“提交所需信息”带上（不同后端实现字段名可能不同，所以做兼容）
+      const commitPayload: any = {
+        receipt_id: receiptId,
+        receipt_no: receiptNo,
+        can_commit: true,
+        valid_rows: validRows,
+      };
+
+      // 常见的“提交令牌/批次号”兼容字段（如果后端 validate 有返回，这里会带上）
+      const commitToken =
+        validateRes?.commit_token ??
+        validateRes?.data?.commit_token ??
+        validateRes?.token ??
+        validateRes?.data?.token ??
+        validateRes?.commitToken ??
+        validateRes?.data?.commitToken;
+
+      const batchId =
+        validateRes?.batch_id ??
+        validateRes?.data?.batch_id ??
+        validateRes?.import_batch_id ??
+        validateRes?.data?.import_batch_id ??
+        validateRes?.batchId ??
+        validateRes?.data?.batchId;
+
+      if (commitToken) commitPayload.commit_token = commitToken;
+      if (batchId) commitPayload.batch_id = batchId;
+
       const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
         method: "POST",
-        headers: buildAdminHeaders(undefined, idemKey("commit")),
+        headers: buildAdminHeaders("application/json", idemKey("commit")),
+        body: JSON.stringify(commitPayload),
       });
 
-      const ok = !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success);
+      const ok = !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success ?? commitRes?.data?.success);
       if (!ok) {
         await rollbackReceipt(receiptId);
         showToast("导入失败：提交失败");
