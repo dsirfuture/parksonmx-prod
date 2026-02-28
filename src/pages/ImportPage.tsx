@@ -22,6 +22,11 @@ function buildAdminHeaders(contentType?: string, idem?: string): Headers {
   return h;
 }
 
+function toNum(v: any) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 export default function ImportPage() {
   const navigate = useNavigate();
   const [toast, setToast] = useState<string | null>(null);
@@ -89,51 +94,36 @@ export default function ImportPage() {
       });
 
       const canCommit = !!(validateRes?.can_commit ?? validateRes?.data?.can_commit);
-      const validRows = Number(validateRes?.valid_rows ?? validateRes?.data?.valid_rows ?? 0);
+      const validRows = toNum(validateRes?.valid_rows ?? validateRes?.data?.valid_rows);
 
-      if (!canCommit || !Number.isFinite(validRows) || validRows <= 0) {
+      if (!canCommit || validRows <= 0) {
         await rollbackReceipt(receiptId);
         showToast("导入错误，请调整表格内标题");
         return;
       }
 
       // 3) commit
-      // ✅ 关键修复：commit 必须发送 JSON body，否则后端 req.json() 会报 “Unexpected end of JSON input”
-      // 同时尽可能把 validate 返回的“提交所需信息”带上（不同后端实现字段名可能不同，所以做兼容）
-      const commitPayload: any = {
-        receipt_id: receiptId,
-        receipt_no: receiptNo,
-        can_commit: true,
-        valid_rows: validRows,
-      };
-
-      // 常见的“提交令牌/批次号”兼容字段（如果后端 validate 有返回，这里会带上）
-      const commitToken =
-        validateRes?.commit_token ??
-        validateRes?.data?.commit_token ??
-        validateRes?.token ??
-        validateRes?.data?.token ??
-        validateRes?.commitToken ??
-        validateRes?.data?.commitToken;
-
-      const batchId =
-        validateRes?.batch_id ??
-        validateRes?.data?.batch_id ??
-        validateRes?.import_batch_id ??
-        validateRes?.data?.import_batch_id ??
-        validateRes?.batchId ??
-        validateRes?.data?.batchId;
-
-      if (commitToken) commitPayload.commit_token = commitToken;
-      if (batchId) commitPayload.batch_id = batchId;
-
       const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
         method: "POST",
-        headers: buildAdminHeaders("application/json", idemKey("commit")),
-        body: JSON.stringify(commitPayload),
+        headers: buildAdminHeaders(undefined, idemKey("commit")),
       });
 
-      const ok = !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success ?? commitRes?.data?.success);
+      /**
+       * ✅ 兼容后端真实返回结构：
+       * - 新结构：{ receipt, imported_items, batch: { status: "committed" } }
+       * - 旧结构：{ ok: true } / { success: true } / { data: { ok: true } }
+       */
+      const batchStatus =
+        commitRes?.batch?.status ??
+        commitRes?.data?.batch?.status ??
+        commitRes?.status ??
+        commitRes?.data?.status;
+
+      const importedItems = toNum(commitRes?.imported_items ?? commitRes?.data?.imported_items);
+      const legacyOk = !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success ?? commitRes?.data?.success);
+
+      const ok = legacyOk || batchStatus === "committed" || importedItems > 0;
+
       if (!ok) {
         await rollbackReceipt(receiptId);
         showToast("导入失败：提交失败");
