@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght@400" />
+    <title>PARKSONMX - 验货系统</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-slate-100">
+    <script>
+      // Guard window.fetch from being overwritten by polyfills
+      (function() {
+        if (typeof window !== 'undefined' && window.fetch) {
+          try {
+            const originalFetch = window.fetch;
+            Object.defineProperty(window, 'fetch', {
+              configurable: true,
+              enumerable: true,
+              get: function() {
+                return originalFetch;
+              },
+              set: function(v) {
+                console.warn('Prevented attempt to overwrite window.fetch');
+              }
+            });
+          } catch (e) {
+            console.error('Failed to guard window.fetch:', e);
+          }
+        }
+      })();
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

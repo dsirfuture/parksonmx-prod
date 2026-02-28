@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+/* PARKSONMX brand tokens */
+:root {
+  --color-primary: #2f3c7e;
+  --color-secondary: #fbeaeb;
+  --color-background: #f4f6fa;
+}
+
+/* Global */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-background);
+  font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "HarmonyOS Sans", "Noto Sans SC", "Inter",
+    "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
