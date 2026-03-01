@@ -42,12 +42,25 @@ export default function ShareEvidencePage() {
   const receiptId = sp.get("receiptId") || "";
   const sku = sp.get("sku") || "";
 
+  // ✅ 新增：从短链 /e/{token} 跳转带过来的 token
+  const shareToken = sp.get("token") || "";
+
   const [lang, setLang] = useState<"ZH" | "ES">("ZH");
 
   // 预览用索引（支持全部图片）
   const [previewIndex, setPreviewIndex] = useState<number>(-1);
 
   const [item, setItem] = useState<any>(null);
+
+  // ✅ 新增：把 token 写入 localStorage，让 apiFetch 自动带 X-Share-Token（不改 UI）
+  useEffect(() => {
+    if (!shareToken) return;
+    try {
+      localStorage.setItem("psmx_share_token", shareToken);
+      localStorage.setItem("parksonmx:share_token", shareToken);
+      localStorage.setItem("SHARE_TOKEN", shareToken);
+    } catch {}
+  }, [shareToken]);
 
   // localStorage 作为兜底（但不再强行覆盖后端证据/时间）
   useEffect(() => {
