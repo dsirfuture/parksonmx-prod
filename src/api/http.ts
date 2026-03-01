@@ -58,15 +58,12 @@ function readTenantId(): string {
 
 function readCompanyId(): string {
   const cfg = readBackendConfig();
-  return (
-    (cfg.companyId ? String(cfg.companyId) : "") || String((import.meta as any)?.env?.VITE_COMPANY_ID || "")
-  ).trim();
+  return ((cfg.companyId ? String(cfg.companyId) : "") || String((import.meta as any)?.env?.VITE_COMPANY_ID || "")).trim();
 }
 
 function setIfMissingOrEmpty(h: Headers, key: string, value: string) {
   if (!value) return;
   const existed = h.get(key);
-  // ✅ 关键：不存在 或 值为空字符串/空白/ "null"/"undefined" 都要覆盖写入
   if (!existed || !String(existed).trim() || existed === "null" || existed === "undefined") {
     h.set(key, value);
   }
@@ -75,18 +72,16 @@ function setIfMissingOrEmpty(h: Headers, key: string, value: string) {
 function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
   const h = new Headers();
 
-  // 合并调用方 headers（调用方优先）
   if (extra) {
     const tmp = new Headers(extra);
     tmp.forEach((v, k) => h.set(k, v));
   }
 
-  // ✅ 强制补齐三件套：即使上层传了空值，也要纠正
+  // ✅ 强制补齐（即便上层传空也纠正）
   setIfMissingOrEmpty(h, "X-User-Id", readUserId());
   setIfMissingOrEmpty(h, "X-Tenant-Id", readTenantId());
   setIfMissingOrEmpty(h, "X-Company-Id", readCompanyId());
 
-  // Share token（可选）
   const shareToken =
     localStorage.getItem("psmx_share_token") ||
     localStorage.getItem("parksonmx:share_token") ||
@@ -128,11 +123,21 @@ export async function apiFetch<T = any>(url: string, options: ApiFetchOptions = 
 
   if (!res.ok) {
     const payload = await readJsonSafe(res);
-    const msg =
+    const baseMsg =
       (payload?.error?.message as string) ||
       (payload?.message as string) ||
       `HTTP_${res.status}`;
-    const err: any = new Error(msg);
+
+    // ✅ 关键：401/403 时把“实际发出去的头”带出来（手机直接看红字就知道缺哪个）
+    let extraHint = "";
+    if (res.status === 401 || res.status === 403) {
+      extraHint =
+        ` | X-User-Id=${headers.get("X-User-Id") || ""}` +
+        ` | X-Tenant-Id=${headers.get("X-Tenant-Id") || ""}` +
+        ` | X-Company-Id=${headers.get("X-Company-Id") || ""}`;
+    }
+
+    const err: any = new Error(`${baseMsg}${extraHint}`);
     err.status = res.status;
     err.payload = payload;
     err.url = abs;
