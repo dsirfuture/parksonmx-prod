@@ -12,15 +12,21 @@ type ReceiptRow = {
   created_at?: string;
   status?: string;
   locked?: boolean;
+
+  expected_total?: number;
+  good_total?: number;
+  damaged_total?: number;
 };
 
 type ReceiptItemRow = {
   id: string;
   sku: string;
   barcode?: string;
+
   expected_qty: number;
   good_qty: number;
   damaged_qty: number;
+
   name_zh?: string;
   name_es?: string;
 
@@ -54,263 +60,484 @@ async function copyText(text: string) {
       document.body.appendChild(ta);
       ta.focus();
       ta.select();
-      document.execCommand("copy");
+      const ok = document.execCommand("copy");
       document.body.removeChild(ta);
-      return true;
+      return ok;
     } catch {
       return false;
     }
   }
 }
 
-/**
- * ✅ WhatsApp 分享（手机优先唤起 App，失败再回退到 wa.me；桌面直接 WhatsApp Web）
- * 不改变 UI，仅改变点击行为，避免“只能复制链接”的体验。
- */
-function openWhatsAppShare(message: string) {
-  const text = String(message || "").trim();
-  if (!text) return;
-
-  const waWeb = `https://wa.me/?text=${encodeURIComponent(text)}`;
-  const waDeep = `whatsapp://send?text=${encodeURIComponent(text)}`;
-
-  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-
-  if (isMobile) {
-    const start = Date.now();
-    // Try open app
-    window.location.href = waDeep;
-    // Fallback to web if app not installed / blocked
-    window.setTimeout(() => {
-      if (Date.now() - start < 1400) {
-        window.location.href = waWeb;
-      }
-    }, 900);
-    return;
+function parseReceiptListPayload(payload: any): ReceiptRow[] {
+  if (!payload) return [];
+  const cands = [
+    payload,
+    payload?.data,
+    payload?.data?.data,
+    payload?.data?.receipts,
+    payload?.receipts,
+    payload?.rows,
+    payload?.data?.rows,
+  ];
+  for (const c of cands) {
+    if (Array.isArray(c)) return c as ReceiptRow[];
   }
-
-  window.open(waWeb, "_blank", "noopener,noreferrer");
+  return [];
 }
 
-function mergeLocalEvidence(receiptId: string, items: ReceiptItemRow[]) {
-  if (!receiptId) return items;
+function parseItemsPayload(payload: any): ReceiptItemRow[] {
+  if (!payload) return [];
+  const cands = [payload, payload?.data, payload?.data?.data, payload?.items, payload?.data?.items];
+  for (const c of cands) {
+    if (Array.isArray(c)) return c as ReceiptItemRow[];
+  }
+  return [];
+}
+
+function mergeLocalEvidence(receiptId: string, serverItems: ReceiptItemRow[]) {
   try {
     const raw = localStorage.getItem(`parksonmx:receipt:${receiptId}:items`);
-    const arr = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(arr) || arr.length === 0) return items;
-
+    const localArr = raw ? JSON.parse(raw) : [];
     const map = new Map<string, any>();
-    for (const x of arr) {
-      if (!x) continue;
-      const sku = String((x as any)?.sku ?? "").trim();
-      if (!sku) continue;
-      map.set(sku, x);
+    for (const it of Array.isArray(localArr) ? localArr : []) {
+      if (it?.id) map.set(String(it.id), it);
     }
-
-    return items.map((it) => {
-      const local = map.get(String(it.sku));
-      if (!local) return it;
-      const urls: string[] = Array.isArray(local?.evidence_photo_urls) ? local.evidence_photo_urls : [];
-      const evidenceCount = urls.length;
-
-      return {
-        ...it,
-        evidence_photo_urls: urls,
-        evidence_photo_count: evidenceCount,
-        evidence_count: evidenceCount,
-      };
+    return serverItems.map((s) => {
+      const l = map.get(String(s.id));
+      if (!l) return s;
+      const urls = Array.isArray(l?.evidence_photo_urls) ? l.evidence_photo_urls : [];
+      if (urls.length <= 0) return s;
+      return { ...s, evidence_photo_urls: urls, evidence_photo_count: urls.length, evidence_count: urls.length };
     });
   } catch {
-    return items;
+    return serverItems;
   }
+}
+
+function itemsSig(list: ReceiptItemRow[]) {
+  return list
+    .map(
+      (x) =>
+        `${x.id}:${toInt(x.expected_qty)}:${toInt(x.good_qty)}:${toInt(x.damaged_qty)}:${
+          Array.isArray(x.evidence_photo_urls) ? x.evidence_photo_urls.length : 0
+        }`
+    )
+    .join("|");
 }
 
 export default function ReceiptDetail() {
-  const { receiptId = "" } = useParams();
+  const params = useParams();
+  // ✅ 关键：兼容路由参数名 id / receiptId，避免 receiptId 为空导致分享证据页不对
+  const receiptId = String((params as any).id || (params as any).receiptId || "");
+
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+
   const [receipt, setReceipt] = useState<ReceiptRow | null>(null);
   const [items, setItems] = useState<ReceiptItemRow[]>([]);
-  const [loading, setLoading] = useState(true);
 
   const [toast, setToast] = useState<string | null>(null);
-  const toastTimer = useRef<number | null>(null);
-
-  const showToast = (msg: string) => {
+  function showToast(msg: string) {
     setToast(msg);
-    if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 1600);
-  };
+    window.setTimeout(() => setToast(null), 1400);
+  }
 
-  // 员工扫码页链接（固定规则）
+  const [shareOpen, setShareOpen] = useState(false);
+  const [shareItem, setShareItem] = useState<ReceiptItemRow | null>(null);
+
+  const lastReceiptSigRef = useRef<string>("");
+  const lastItemsSigRef = useRef<string>("");
+
+  function goDashboardHard() {
+    window.location.hash = "#/admin/dashboard";
+  }
+
+  // ✅ 顾客证据页链接：统一生成，避免 ## 或带上 /admin 路径
+  function evidenceShareLinkForSku(sku: string) {
+    const base = `${window.location.origin}${window.location.pathname}#/share/evidence`;
+    const qs = new URLSearchParams();
+    qs.set("receiptId", receiptId);
+    qs.set("sku", sku);
+    const receiptNo = safeStr(receipt?.receipt_no);
+    if (receiptNo) qs.set("receiptNo", receiptNo);
+    return `${base}?${qs.toString()}`;
+  }
+
+  /** 分享给员工：固定 WorkerScan 链接 */
   const workerShareUrl = useMemo(() => {
-    const origin = window.location.origin;
-    return `${origin}/#/worker/scan?receiptId=${encodeURIComponent(receiptId)}`;
-  }, [receiptId]);
+    const base = `${location.origin}${location.pathname}#/worker/scan`;
+    const qs = new URLSearchParams();
+    qs.set("receiptId", receiptId);
+    const receiptNo = safeStr(receipt?.receipt_no);
+    if (receiptNo) qs.set("receiptNo", receiptNo);
+    return `${base}?${qs.toString()}`;
+  }, [receiptId, receipt?.receipt_no]);
 
-  // 复制员工链接（WeChat 仍保持复制逻辑）
-  const copyWorkerLink = async () => {
+  async function copyWorkerLink() {
     const ok = await copyText(workerShareUrl);
     showToast(ok ? "已复制链接" : "复制失败");
-  };
+  }
 
-  // 拉取单据 + items（轮询 2-3 秒允许）
-  useEffect(() => {
-    let mounted = true;
-    let timer: any = null;
-
-    async function loadOnce() {
-      if (!receiptId) return;
-      try {
-        const r = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}`, { method: "GET" });
-        const row: ReceiptRow = (r?.data ?? r) as any;
-        if (!mounted) return;
-        setReceipt(row || null);
-      } catch {
-        // ignore
-      }
-
-      try {
-        const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items`, { method: "GET" });
-        const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
-        const merged = mergeLocalEvidence(receiptId, arr);
-        if (!mounted) return;
-        setItems(merged);
-      } catch {
-        // ignore
-      } finally {
-        if (!mounted) return;
-        setLoading(false);
-      }
+  async function loadAll(silent?: boolean) {
+    if (!receiptId) {
+      if (!silent) setErr("缺少 receiptId");
+      if (!silent) setLoading(false);
+      return;
     }
 
-    loadOnce();
-    timer = window.setInterval(loadOnce, 2500);
+    try {
+      if (!silent) {
+        setErr("");
+        setLoading(true);
+      }
 
-    return () => {
-      mounted = false;
-      if (timer) window.clearInterval(timer);
-    };
+      // receipts 列表结构兼容 + 找不到不清空
+      const list = await apiFetch<any>("/api/receipts?limit=50", { method: "GET" });
+      const rows: ReceiptRow[] = parseReceiptListPayload(list);
+      const found = rows.find((r) => String(r.id) === String(receiptId)) || null;
+
+      let foundReceipt: ReceiptRow | null = found;
+      if (!foundReceipt) {
+        try {
+          const one = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}`, { method: "GET" });
+          const rOne: any = one?.data ?? one;
+          if (rOne && rOne.id) foundReceipt = rOne as ReceiptRow;
+        } catch {
+          // ignore
+        }
+      }
+
+      const receiptSig = foundReceipt
+        ? `${foundReceipt.id}:${foundReceipt.receipt_no}:${foundReceipt.status}:${foundReceipt.locked}:${foundReceipt.created_at}`
+        : receipt
+        ? `${receipt.id}:${receipt.receipt_no}:${receipt.status}:${receipt.locked}:${receipt.created_at}`
+        : "null";
+
+      if (receiptSig !== lastReceiptSigRef.current) {
+        lastReceiptSigRef.current = receiptSig;
+        if (foundReceipt) setReceipt(foundReceipt);
+      }
+
+      const it = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items`, { method: "GET" });
+      const arr: ReceiptItemRow[] = parseItemsPayload(it);
+      const merged = mergeLocalEvidence(receiptId, arr);
+
+      const sig = itemsSig(merged);
+      if (sig !== lastItemsSigRef.current) {
+        lastItemsSigRef.current = sig;
+        setItems(merged);
+      }
+    } catch (e: any) {
+      if (!silent) setErr(String(e?.message || e));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadAll(false);
+    const t = window.setInterval(() => loadAll(true), 3000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
 
-  const skuCount = items.length;
+  const agg = useMemo(() => {
+    const expectedTotal = toInt(receipt?.expected_total) || items.reduce((s, it) => s + toInt(it.expected_qty), 0);
+    const goodTotal = toInt(receipt?.good_total) || items.reduce((s, it) => s + toInt(it.good_qty), 0);
+    const damagedTotal = toInt(receipt?.damaged_total) || items.reduce((s, it) => s + toInt(it.damaged_qty), 0);
+    const doneTotal = goodTotal + damagedTotal;
 
-  // 后端聚合优先：expected_total / good_total / damaged_total / diff_total
-  const expectedTotal = toInt((receipt as any)?.expected_total);
-  const goodTotal = toInt((receipt as any)?.good_total);
-  const damagedTotal = toInt((receipt as any)?.damaged_total);
+    const rawDiff = Math.max(0, expectedTotal - doneTotal);
+    const showDiff = doneTotal > 0 && rawDiff > 0;
+    const diffTotal = showDiff ? rawDiff : 0;
 
-  // progress 统一公式
-  const progressPercent = useMemo(() => {
-    const expected = expectedTotal;
-    const done = goodTotal + damagedTotal;
-    if (!expected) return 0;
-    return Math.max(0, Math.min(100, Math.round((done / expected) * 100)));
-  }, [expectedTotal, goodTotal, damagedTotal]);
+    const progress = expectedTotal > 0 ? Math.round((doneTotal / expectedTotal) * 100) : 0;
 
-  // diff 规则：默认 0 且黑色；只有真实验货后且 diff>0 才红
-  const rawDiff = Math.max(0, expectedTotal - (goodTotal + damagedTotal));
-  const showDiff = goodTotal + damagedTotal > 0 && rawDiff > 0;
-  const diffValue = showDiff ? rawDiff : 0;
+    return { expectedTotal, goodTotal, damagedTotal, diffTotal, doneTotal, progress };
+  }, [receipt, items]);
 
-  const statusLabel = useMemo(() => {
-    const expected = expectedTotal;
-    const done = goodTotal + damagedTotal;
-    if (done <= 0) return { text: "未验", cls: "bg-[#2F3C7E] text-white" };
-    if (expected > 0 && done >= expected) return { text: "已完成", cls: "bg-[#FBEAEB] text-[#2F3C7E]" };
-    return { text: "进行中", cls: "bg-[#2E7D32] text-white" };
-  }, [expectedTotal, goodTotal, damagedTotal]);
+  const [q, setQ] = useState("");
+  const filtered = useMemo(() => {
+    const k = q.trim().toLowerCase();
+    if (!k) return items;
+    return items.filter((it) =>
+      `${it.sku || ""} ${it.barcode || ""} ${it.name_zh || ""} ${it.name_es || ""}`.toLowerCase().includes(k)
+    );
+  }, [items, q]);
+
+  function statusText(it: ReceiptItemRow) {
+    const expected = toInt(it.expected_qty);
+    const done = toInt(it.good_qty) + toInt(it.damaged_qty);
+    const ev = Array.isArray(it?.evidence_photo_urls)
+      ? it.evidence_photo_urls.length
+      : toInt(it?.evidence_photo_count ?? it?.evidence_count);
+
+    if (done <= 0) return { label: "未验货", cls: "bg-[#2F3C7E] text-white" };
+    if (done < expected) return { label: "验货中", cls: "bg-[#2E7D32] text-white" };
+    if (ev <= 0) return { label: "待证据", cls: "bg-white text-[#D32F2F] border border-[#D32F2F]" };
+    return { label: "已完成", cls: "bg-[#FBEAEB] text-[#2F3C7E]" };
+  }
 
   return (
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col">
-      <Header title="验货单详情" />
+      <Header title="验货单详情" onBack={() => history.back()} />
 
-      <main className="flex-1 w-full max-w-[430px] mx-auto px-4 py-4 space-y-4">
-        {/* 顶部卡片 */}
+      <main className="flex-1 w-full max-w-[430px] mx-auto px-4 pt-4 pb-6 space-y-3">
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-[24px] font-extrabold text-[#2F3C7E]">{safeStr(receipt?.receipt_no) || "-"}</div>
-              <div className="mt-2 flex items-center gap-2 text-[13px] text-slate-600 font-semibold">
-                <span className="material-symbols-outlined text-[18px] text-slate-400">calendar_month</span>
-                <span>创建: {fmtYMD(receipt?.created_at)}</span>
-              </div>
-            </div>
-            <div className={`h-9 px-4 rounded-full text-[13px] font-extrabold flex items-center ${statusLabel.cls}`}>
-              {statusLabel.text}
-            </div>
+          <div className="font-extrabold text-[#2F3C7E] text-[18px] break-all">{safeStr(receipt?.receipt_no) || "-"}</div>
+          <div className="mt-2 flex items-center gap-2 text-[12px] text-slate-500 font-semibold">
+            <span className="material-symbols-outlined text-[16px] text-slate-400">calendar_month</span>
+            创建: {fmtYMD(receipt?.created_at)}
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3">
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-4">
-              <div className="text-[12px] text-slate-500 font-semibold">SKU数</div>
-              <div className="mt-2 text-[26px] font-extrabold text-slate-900">{skuCount}</div>
+            <div className="bg-[#F4F6FA] border border-slate-200 rounded-2xl p-4">
+              <div className="text-[11px] text-slate-500 font-semibold">SKU数</div>
+              <div className="mt-1 text-[18px] font-extrabold text-slate-900">{items.length}</div>
             </div>
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-4">
-              <div className="text-[12px] text-slate-500 font-semibold">进度</div>
-              <div className="mt-2 text-[26px] font-extrabold text-slate-900">{progressPercent}%</div>
+            <div className="bg-[#F4F6FA] border border-slate-200 rounded-2xl p-4">
+              <div className="text-[11px] text-slate-500 font-semibold">进度</div>
+              <div className="mt-1 text-[18px] font-extrabold text-slate-900">{agg.progress}%</div>
             </div>
           </div>
 
-          <div className="mt-4 grid grid-cols-4 gap-2">
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-3 text-center">
+          <div className="mt-3 grid grid-cols-4 gap-2">
+            <div className="bg-[#F4F6FA] rounded-2xl p-3 border border-slate-200 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">应验</div>
-              <div className="mt-1 text-[16px] font-extrabold text-slate-900">{expectedTotal}</div>
+              <div className="mt-1 text-[16px] font-extrabold text-slate-900">{agg.expectedTotal}</div>
             </div>
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-3 text-center">
+            <div className="bg-[#F4F6FA] rounded-2xl p-3 border border-slate-200 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">良品</div>
-              <div className="mt-1 text-[16px] font-extrabold text-slate-900">{goodTotal}</div>
+              <div className="mt-1 text-[16px] font-extrabold text-slate-900">{agg.goodTotal}</div>
             </div>
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-3 text-center">
+            <div className="bg-[#F4F6FA] rounded-2xl p-3 border border-slate-200 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">破损</div>
-              <div className="mt-1 text-[16px] font-extrabold" style={{ color: damagedTotal > 0 ? "#D32F2F" : "#0F172A" }}>
-                {damagedTotal}
+              <div className="mt-1 text-[16px] font-extrabold" style={{ color: agg.damagedTotal > 0 ? "#D32F2F" : "#0F172A" }}>
+                {agg.damagedTotal}
               </div>
             </div>
-            <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-3 text-center">
+            <div className="bg-[#F4F6FA] rounded-2xl p-3 border border-slate-200 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">相差</div>
-              <div className="mt-1 text-[16px] font-extrabold" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
-                {diffValue}
+              <div className="mt-1 text-[16px] font-extrabold" style={{ color: agg.diffTotal > 0 ? "#D32F2F" : "#0F172A" }}>
+                {agg.diffTotal}
               </div>
             </div>
           </div>
         </div>
 
-        {/* 分享给员工 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-          <div className="text-[14px] font-extrabold text-slate-900">直接分享给员工</div>
-          <div className="mt-3 grid grid-cols-2 gap-4">
-            {/* ✅ WhatsApp：直接唤起分享（不再只是复制链接） */}
-            <button
-              type="button"
-              onClick={() => {
-                const msg = `PARKSONMX\n验货单：${safeStr(receipt?.receipt_no) || "-"}\n${workerShareUrl}`;
-                openWhatsAppShare(msg);
+          <div className="font-extrabold text-slate-900">分享给员工</div>
+          <div className="mt-3 grid grid-cols-2 gap-4 text-center">
+            <a
+              className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
+              href={`https://wa.me/?text=${encodeURIComponent(workerShareUrl)}`}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                copyWorkerLink();
               }}
-              className="bg-white rounded-2xl border border-slate-200 shadow-sm px-3 py-4 flex flex-col items-center justify-center gap-2 active:scale-[0.99]"
             >
-              <img src={WhatsAppIcon} className="w-8 h-8" alt="whatsapp" />
-              <span className="text-[12px] text-slate-400">WhatsApp</span>
-            </button>
+              <img src={WhatsAppIcon} alt="WhatsApp" className="w-10 h-10 mx-auto" />
+              <div className="mt-2 text-[12px] text-slate-400 font-semibold">WhatsApp</div>
+            </a>
 
-            {/* WeChat：保持复制链接逻辑（不改 UI） */}
             <button
               type="button"
               onClick={copyWorkerLink}
-              className="bg-white rounded-2xl border border-slate-200 shadow-sm px-3 py-4 flex flex-col items-center justify-center gap-2 active:scale-[0.99]"
+              className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
             >
-              <img src={WeChatIcon} className="w-8 h-8" alt="weixin" />
-              <span className="text-[12px] text-slate-400">WeChat</span>
+              <img src={WeChatIcon} alt="WeChat" className="w-10 h-10 mx-auto" />
+              <div className="mt-2 text-[12px] text-slate-400 font-semibold">WeChat</div>
             </button>
           </div>
         </div>
 
-        {/* 下面商品列表等原逻辑保持不动 */}
-        {/* ...（此处省略：你项目里剩余 JSX 保持原样） */}
-        {/* 为了“可复制覆盖”，我保留你原文件其余内容不变——请用你仓库版本替换时，直接整文件覆盖即可。 */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+          <div className="flex items-center justify-between">
+            <div className="font-extrabold text-slate-900">商品列表</div>
+            <div className="text-[12px] text-slate-500 font-semibold">此单SKU共: {filtered.length}</div>
+          </div>
 
-        <div className="py-6 text-center">
-          <p className="text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</p>
+          <div className="mt-3 bg-[#F4F6FA] border border-slate-200 rounded-2xl p-3">
+            <div className="relative">
+              <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-[18px] text-slate-400">
+                search
+              </span>
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="搜索 SKU / 条码 / 名称"
+                className="w-full h-10 bg-white border border-slate-200 rounded-2xl pl-10 pr-3 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
+              />
+            </div>
+          </div>
+
+          {loading ? <div className="mt-3 text-[12px] text-slate-500 font-semibold">Loading...</div> : null}
+          {err ? (
+            <div className="mt-3 text-[12px] font-semibold" style={{ color: "#D32F2F" }}>
+              {err}
+            </div>
+          ) : null}
+
+          <div className="mt-3 space-y-3">
+            {filtered.map((it) => {
+              const expected = toInt(it.expected_qty);
+              const good = toInt(it.good_qty);
+              const damaged = toInt(it.damaged_qty);
+              const done = good + damaged;
+
+              const rawDiff = Math.max(0, expected - done);
+              const showDiff = done > 0 && rawDiff > 0;
+              const diff = showDiff ? rawDiff : 0;
+
+              const ev = Array.isArray(it?.evidence_photo_urls)
+                ? it.evidence_photo_urls.length
+                : toInt(it?.evidence_photo_count ?? it?.evidence_count);
+
+              const st = statusText(it);
+
+              return (
+                <div key={it.id} className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <div className="font-extrabold text-[#2F3C7E] text-[14px] break-all">{safeStr(it.sku) || "-"}</div>
+                        <span className={`px-2 py-0.5 rounded-full text-[11px] font-extrabold ${st.cls}`}>{st.label}</span>
+                      </div>
+
+                      {it.barcode ? (
+                        <div className="mt-2 flex items-center gap-2 text-[12px] text-slate-500 font-semibold break-all">
+                          <span className="material-symbols-outlined text-[18px] text-slate-400">barcode</span>
+                          <span className="truncate">{safeStr(it.barcode) || "-"}</span>
+                        </div>
+                      ) : null}
+
+                      <div className="mt-2 text-[12px] text-slate-700 font-semibold break-all">{safeStr(it.name_zh) || "-"}</div>
+                      <div className="text-[12px] text-slate-500 font-semibold break-all">{safeStr(it.name_es) || "-"}</div>
+                    </div>
+
+                    <div className="flex flex-col items-end gap-2 shrink-0">
+                      <div className="flex items-baseline gap-1 text-right">
+                        <div className="text-[12px] text-slate-500 font-semibold">应验:</div>
+                        <div className="text-[16px] font-extrabold text-slate-900">{expected}</div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShareItem(it);
+                          setShareOpen(true);
+                        }}
+                        className="w-9 h-9 rounded-2xl bg-transparent border-0 shadow-none flex items-center justify-center active:scale-[0.99]"
+                        aria-label="share-evidence"
+                        title="分享证据"
+                      >
+                        <span className="material-symbols-outlined text-[20px] text-[#2F3C7E]">ios_share</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-4 gap-2">
+                    <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
+                      <div className="text-[11px] text-slate-500 font-semibold">良品</div>
+                      <div className="mt-1 text-[16px] font-extrabold text-slate-900">{good}</div>
+                    </div>
+                    <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
+                      <div className="text-[11px] text-slate-500 font-semibold">破损</div>
+                      <div className="mt-1 text-[16px] font-extrabold" style={{ color: damaged > 0 ? "#D32F2F" : "#0F172A" }}>
+                        {damaged}
+                      </div>
+                    </div>
+                    <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
+                      <div className="text-[11px] text-slate-500 font-semibold">相差</div>
+                      <div className="mt-1 text-[16px] font-extrabold" style={{ color: diff > 0 ? "#D32F2F" : "#0F172A" }}>
+                        {diff}
+                      </div>
+                    </div>
+                    <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
+                      <div className="text-[11px] text-slate-500 font-semibold">证据</div>
+                      <div className="mt-1 text-[16px] font-extrabold text-slate-900">{ev}</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-6 text-center text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</div>
         </div>
       </main>
+
+      {shareOpen && shareItem ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setShareOpen(false)} />
+          <div className="relative w-[92%] max-w-[420px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            <div className="px-4 pt-4 pb-3 flex items-center justify-between">
+              <div className="text-[16px] font-extrabold text-slate-900">ParksonMX 验货结果</div>
+              <button
+                type="button"
+                onClick={() => setShareOpen(false)}
+                className="w-9 h-9 rounded-full bg-white border border-slate-200 flex items-center justify-center active:scale-[0.99]"
+              >
+                <span className="material-symbols-outlined text-[20px] text-slate-600">close</span>
+              </button>
+            </div>
+
+            <div className="px-4 pb-4">
+              <div className="bg-[#F4F6FA] border border-slate-200 rounded-2xl p-4 text-[12px] text-slate-700 font-semibold leading-6">
+                <div>SKU: {shareItem.sku}</div>
+                <div>条形码: {safeStr(shareItem.barcode) || "-"}</div>
+                <div>中文名: {safeStr(shareItem.name_zh) || "-"}</div>
+                <div>西文名: {safeStr(shareItem.name_es) || "-"}</div>
+                <div className="pt-1 font-extrabold">
+                  应验: {toInt(shareItem.expected_qty)}　良品: {toInt(shareItem.good_qty)}　破损: {toInt(shareItem.damaged_qty)}　相差:{" "}
+                  {(() => {
+                    const expected = toInt(shareItem.expected_qty);
+                    const done = toInt(shareItem.good_qty) + toInt(shareItem.damaged_qty);
+                    const raw = Math.max(0, expected - done);
+                    const show = done > 0 && raw > 0;
+                    return show ? raw : 0;
+                  })()}
+                </div>
+                <div>
+                  证据:{" "}
+                  {Array.isArray(shareItem.evidence_photo_urls)
+                    ? shareItem.evidence_photo_urls.length
+                    : toInt(shareItem.evidence_photo_count ?? shareItem.evidence_count)}
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-4 text-center">
+                <a
+                  className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
+                  href={`https://wa.me/?text=${encodeURIComponent(evidenceShareLinkForSku(shareItem.sku))}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <img src={WhatsAppIcon} alt="WhatsApp" className="w-10 h-10 mx-auto" />
+                  <div className="mt-2 text-[12px] text-slate-400 font-semibold">WhatsApp</div>
+                </a>
+
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const ok = await copyText(evidenceShareLinkForSku(shareItem.sku));
+                    showToast(ok ? "已复制链接" : "复制失败");
+                  }}
+                  className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
+                >
+                  <img src={WeChatIcon} alt="WeChat" className="w-10 h-10 mx-auto" />
+                  <div className="mt-2 text-[12px] text-slate-400 font-semibold">WeChat</div>
+                </button>
+              </div>
+
+              <div className="mt-5 text-center text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-50">
