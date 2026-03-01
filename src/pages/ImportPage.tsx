@@ -14,10 +14,23 @@ function toNum(v: any) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function pickBatchId(validateRes: any): string {
+  const candidates = [
+    validateRes?.batch_id,
+    validateRes?.data?.batch_id,
+    validateRes?.batch?.id,
+    validateRes?.data?.batch?.id,
+    validateRes?.batchId,
+    validateRes?.data?.batchId,
+  ];
+  const got = candidates.find((x) => typeof x === "string" && x.trim());
+  return (got || "").trim();
+}
+
 export default function ImportPage() {
   const navigate = useNavigate();
   const [toast, setToast] = useState<string | null>(null);
-  const [pickedName, setPickedName] = useState<string>(""); // 只显示文件名
+  const [pickedName, setPickedName] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
   const showToast = (msg: string) => {
@@ -31,13 +44,26 @@ export default function ImportPage() {
     try {
       await apiFetch(`/api/receipts/${encodeURIComponent(receiptId)}`, {
         method: "DELETE",
-        headers: {
-          "Idempotency-Key": idemKey("rollback"),
-        },
+        headers: { "Idempotency-Key": idemKey("rollback") },
       });
     } catch {
       // ignore
     }
+  }
+
+  function toastFromError(e: any) {
+    const msg = String(e?.message || "");
+    const payloadMsg = String(e?.payload?.error?.message || e?.payload?.message || "");
+    const merged = `${msg} ${payloadMsg}`.toLowerCase();
+
+    if (merged.includes("batch_id is required") || merged.includes("batch_id")) {
+      return "导入失败：缺少 batch_id";
+    }
+    if (merged.includes("version_conflict") || e?.status === 409) {
+      return "导入失败：数据冲突，请重试";
+    }
+    // 默认保持你要求的文案
+    return "导入错误，请调整表格内标题";
   }
 
   async function onPickFile(file: File) {
@@ -49,9 +75,7 @@ export default function ImportPage() {
 
     try {
       // 0) 同名检查
-      const list = await apiFetch<any>("/api/receipts?limit=50", {
-        method: "GET",
-      });
+      const list = await apiFetch<any>("/api/receipts?limit=50", { method: "GET" });
       const arr = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : [];
       if (arr.some((r: any) => String(r?.receipt_no || "") === receiptNo)) {
         showToast("文件已存在");
@@ -73,38 +97,60 @@ export default function ImportPage() {
         return;
       }
 
-      // 2) validate（FormData 不要手动 Content-Type）
+      // 2) validate
       const fd = new FormData();
       fd.append("file", file);
 
       const validateRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/validate`, {
         method: "POST",
-        headers: {
-          "Idempotency-Key": idemKey("validate"),
-        },
+        headers: { "Idempotency-Key": idemKey("validate") },
         body: fd,
       });
 
       const canCommit = !!(validateRes?.can_commit ?? validateRes?.data?.can_commit);
       const validRows = toNum(validateRes?.valid_rows ?? validateRes?.data?.valid_rows);
-      const batchId = String(validateRes?.batch_id ?? validateRes?.data?.batch_id ?? "").trim();
+      const batchId = pickBatchId(validateRes);
 
-      // ✅ 关键：commit 需要 batch_id；没有 batch_id 直接视为失败并回滚
-      if (!canCommit || validRows <= 0 || !batchId) {
+      if (!canCommit || validRows <= 0) {
         await rollbackReceipt(receiptId);
         showToast("导入错误，请调整表格内标题");
         return;
       }
+      if (!batchId) {
+        // ✅ 这里不是标题问题，是后端没返回 batch_id（必须明确）
+        await rollbackReceipt(receiptId);
+        showToast("导入失败：缺少 batch_id");
+        return;
+      }
 
-      // 3) commit（必须携带 batch_id）
-      const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": idemKey("commit"),
-        },
-        body: JSON.stringify({ batch_id: batchId }),
-      });
+      // 3) commit（优先 JSON body；若后端不认 body，再 fallback querystring）
+      let commitRes: any = null;
+      try {
+        commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": idemKey("commit"),
+          },
+          body: JSON.stringify({ batch_id: batchId }),
+        });
+      } catch (e: any) {
+        const m = String(e?.message || "").toLowerCase();
+        const pm = String(e?.payload?.error?.message || "").toLowerCase();
+        const merged = `${m} ${pm}`;
+        // 如果明确是 batch_id 问题，再尝试 querystring 方案
+        if (merged.includes("batch_id")) {
+          commitRes = await apiFetch<any>(
+            `/api/receipts/${encodeURIComponent(receiptId)}/import/commit?batch_id=${encodeURIComponent(batchId)}`,
+            {
+              method: "POST",
+              headers: { "Idempotency-Key": idemKey("commit2") },
+            }
+          );
+        } else {
+          throw e;
+        }
+      }
 
       const batchStatus =
         commitRes?.batch?.status ??
@@ -128,8 +174,7 @@ export default function ImportPage() {
       window.setTimeout(() => navigate("/admin/dashboard"), 600);
     } catch (e: any) {
       if (receiptId) await rollbackReceipt(receiptId);
-      // 保持你要求的文案（不额外加冗余）
-      showToast("导入错误，请调整表格内标题");
+      showToast(toastFromError(e));
     } finally {
       setBusy(false);
     }
