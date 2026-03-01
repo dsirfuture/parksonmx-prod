@@ -2,7 +2,6 @@ import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Header } from "../components/Shared";
 import { apiFetch } from "../api/http";
-import { ensureBackendConfigOnce, getBackendConfig } from "../api/backendConfig";
 
 function stripExt(name: string) {
   return name.replace(/\.[^.]+$/, "");
@@ -15,21 +14,10 @@ function toNum(v: any) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function buildAdminHeaders(contentType?: string, idem?: string): Headers {
-  const cfg = getBackendConfig() || ensureBackendConfigOnce();
-  const h = new Headers();
-  h.set("X-User-Id", cfg.adminId);
-  h.set("X-Tenant-Id", cfg.tenantId);
-  h.set("X-Company-Id", cfg.companyId);
-  if (contentType) h.set("Content-Type", contentType);
-  if (idem) h.set("Idempotency-Key", idem);
-  return h;
-}
-
 export default function ImportPage() {
   const navigate = useNavigate();
   const [toast, setToast] = useState<string | null>(null);
-  const [pickedName, setPickedName] = useState<string>("");
+  const [pickedName, setPickedName] = useState<string>(""); // 只显示文件名
   const [busy, setBusy] = useState(false);
 
   const showToast = (msg: string) => {
@@ -43,7 +31,9 @@ export default function ImportPage() {
     try {
       await apiFetch(`/api/receipts/${encodeURIComponent(receiptId)}`, {
         method: "DELETE",
-        headers: buildAdminHeaders(),
+        headers: {
+          "Idempotency-Key": idemKey("rollback"),
+        },
       });
     } catch {
       // ignore
@@ -51,7 +41,6 @@ export default function ImportPage() {
   }
 
   async function onPickFile(file: File) {
-    ensureBackendConfigOnce();
     setPickedName(file.name);
     setBusy(true);
 
@@ -62,7 +51,6 @@ export default function ImportPage() {
       // 0) 同名检查
       const list = await apiFetch<any>("/api/receipts?limit=50", {
         method: "GET",
-        headers: buildAdminHeaders(),
       });
       const arr = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : [];
       if (arr.some((r: any) => String(r?.receipt_no || "") === receiptNo)) {
@@ -73,7 +61,10 @@ export default function ImportPage() {
       // 1) 创建空单
       const created = await apiFetch<any>("/api/receipts", {
         method: "POST",
-        headers: buildAdminHeaders("application/json", idemKey("create")),
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idemKey("create"),
+        },
         body: JSON.stringify({ receipt_no: receiptNo }),
       });
       receiptId = created?.id || created?.data?.id || "";
@@ -82,36 +73,39 @@ export default function ImportPage() {
         return;
       }
 
-      // 2) validate
+      // 2) validate（FormData 不要手动 Content-Type）
       const fd = new FormData();
       fd.append("file", file);
 
       const validateRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/validate`, {
         method: "POST",
-        headers: buildAdminHeaders(), // FormData 不要手动 Content-Type
+        headers: {
+          "Idempotency-Key": idemKey("validate"),
+        },
         body: fd,
       });
 
       const canCommit = !!(validateRes?.can_commit ?? validateRes?.data?.can_commit);
       const validRows = toNum(validateRes?.valid_rows ?? validateRes?.data?.valid_rows);
+      const batchId = String(validateRes?.batch_id ?? validateRes?.data?.batch_id ?? "").trim();
 
-      // ✅ 关键：后端 validate 明确返回 batch_id
-      const batchId: string = String(validateRes?.batch_id ?? validateRes?.data?.batch_id ?? "");
-
+      // ✅ 关键：commit 需要 batch_id；没有 batch_id 直接视为失败并回滚
       if (!canCommit || validRows <= 0 || !batchId) {
         await rollbackReceipt(receiptId);
         showToast("导入错误，请调整表格内标题");
         return;
       }
 
-      // 3) commit（✅ 必须带 batch_id）
+      // 3) commit（必须携带 batch_id）
       const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
         method: "POST",
-        headers: buildAdminHeaders("application/json", idemKey("commit")),
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idemKey("commit"),
+        },
         body: JSON.stringify({ batch_id: batchId }),
       });
 
-      // ✅ 兼容后端真实返回结构：{ receipt, imported_items, batch: { status:"committed" } }
       const batchStatus =
         commitRes?.batch?.status ??
         commitRes?.data?.batch?.status ??
@@ -119,9 +113,10 @@ export default function ImportPage() {
         commitRes?.data?.status;
 
       const importedItems = toNum(commitRes?.imported_items ?? commitRes?.data?.imported_items);
-      const legacyOk = !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success ?? commitRes?.data?.success);
-
-      const ok = legacyOk || batchStatus === "committed" || importedItems > 0;
+      const ok =
+        batchStatus === "committed" ||
+        importedItems > 0 ||
+        !!(commitRes?.ok ?? commitRes?.data?.ok ?? commitRes?.success ?? commitRes?.data?.success);
 
       if (!ok) {
         await rollbackReceipt(receiptId);
@@ -130,8 +125,10 @@ export default function ImportPage() {
       }
 
       showToast("导入成功");
-    } catch {
+      window.setTimeout(() => navigate("/admin/dashboard"), 600);
+    } catch (e: any) {
       if (receiptId) await rollbackReceipt(receiptId);
+      // 保持你要求的文案（不额外加冗余）
       showToast("导入错误，请调整表格内标题");
     } finally {
       setBusy(false);
