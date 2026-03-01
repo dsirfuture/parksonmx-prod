@@ -1,48 +1,60 @@
-// src/api/backendConfig.ts
 export type BackendConfig = {
-  baseUrl: string;     // "" => 走本地同域 + Vite proxy
-  adminId: string;     // X-User-Id
-  tenantId: string;    // X-Tenant-Id
-  companyId: string;   // X-Company-Id
+  baseUrl: string;
+  tenantId: string;
+  companyId: string;
+  adminId: string;
+  workerId?: string;
 };
 
-const KEY = "parksonmx:backend:config";
+const LS_KEY = "parksonmx:backend:config";
+
+function cleanUrl(u: string) {
+  return String(u || "").trim().replace(/\/+$/, "");
+}
 
 export function getBackendConfig(): BackendConfig | null {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(LS_KEY);
     if (!raw) return null;
-    const v = JSON.parse(raw) as Partial<BackendConfig>;
-    if (v.baseUrl === undefined || v.baseUrl === null) return null;
-    if (!v.adminId || !v.tenantId || !v.companyId) return null;
-    return {
-      baseUrl: String(v.baseUrl).trim(), // 允许 ""
-      adminId: String(v.adminId).trim(),
-      tenantId: String(v.tenantId).trim(),
-      companyId: String(v.companyId).trim(),
-    };
+    const cfg = JSON.parse(raw);
+    if (!cfg || typeof cfg !== "object") return null;
+    return cfg as BackendConfig;
   } catch {
     return null;
   }
 }
 
 export function setBackendConfig(cfg: BackendConfig) {
-  localStorage.setItem(KEY, JSON.stringify(cfg));
+  localStorage.setItem(LS_KEY, JSON.stringify(cfg));
+  // ✅ 同步一个通用 user_id，给 api/http.ts 兜底读取
+  if (cfg?.adminId) localStorage.setItem("psmx_user_id", String(cfg.adminId));
 }
 
 /**
- * ✅ 关键：每次启动都强制写入“正确配置”
- * - baseUrl 必须是 ""（让请求走 /api -> Vite proxy）
- * - 避免旧配置导致 Failed to fetch
+ * ✅ 保证任何设备（包含手机）第一次打开也能拿到配置：
+ * 1) 优先读 localStorage
+ * 2) 没有就读 Vercel env：VITE_API_BASE / VITE_ADMIN_ID / VITE_TENANT_ID / VITE_COMPANY_ID
+ * 3) env 齐全就写入 localStorage（让后续页面/请求稳定）
  */
-export function ensureBackendConfigOnce() {
-  const desired: BackendConfig = {
-    baseUrl: "", // ✅ 必须空，走本地代理
-    adminId: "4a819d54-87c8-4c50-b578-fae63b930728",
-    tenantId: "00000000-0000-0000-0000-000000000001",
-    companyId: "11111111-1111-1111-1111-111111111111",
+export function ensureBackendConfigOnce(): BackendConfig {
+  const existed = getBackendConfig();
+  if (existed?.adminId && existed?.tenantId && existed?.companyId) return existed;
+
+  const baseUrl = cleanUrl((import.meta as any)?.env?.VITE_API_BASE || "https://parksonmx.vercel.app");
+  const adminId = String((import.meta as any)?.env?.VITE_ADMIN_ID || "").trim();
+  const tenantId = String((import.meta as any)?.env?.VITE_TENANT_ID || "").trim();
+  const companyId = String((import.meta as any)?.env?.VITE_COMPANY_ID || "").trim();
+
+  const cfg: BackendConfig = {
+    baseUrl,
+    adminId: adminId || (existed?.adminId || ""),
+    tenantId: tenantId || (existed?.tenantId || ""),
+    companyId: companyId || (existed?.companyId || ""),
+    workerId: existed?.workerId,
   };
 
-  setBackendConfig(desired);
-  return desired;
+  // 只有当核心字段齐全才落库，避免写入空配置
+  if (cfg.adminId && cfg.tenantId && cfg.companyId) setBackendConfig(cfg);
+
+  return cfg;
 }
