@@ -5,6 +5,12 @@ export type ApiFetchOptions = RequestInit & {
 
 const DEFAULT_API_BASE = "https://parksonmx.vercel.app";
 
+/** ✅ 兜底：保证手机端永远不会空头 */
+const DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001";
+const DEFAULT_COMPANY_ID = "11111111-1111-1111-1111-111111111111";
+/** 这里用你的 admin user id（你截图里就是这串） */
+const DEFAULT_ADMIN_ID = "4a819d54-87c8-4c50-b578-fae63b930728";
+
 function getApiBase() {
   const v = (import.meta as any)?.env?.VITE_API_BASE;
   return typeof v === "string" && v.trim() ? v.trim().replace(/\/+$/, "") : DEFAULT_API_BASE;
@@ -47,23 +53,32 @@ function readUserId(): string {
     (cfg.adminId ? String(cfg.adminId) : "") ||
     (cfg.workerId ? String(cfg.workerId) : "") ||
     String((import.meta as any)?.env?.VITE_ADMIN_ID || "").trim() ||
-    ""
+    DEFAULT_ADMIN_ID
   ).trim();
 }
 
 function readTenantId(): string {
   const cfg = readBackendConfig();
-  return ((cfg.tenantId ? String(cfg.tenantId) : "") || String((import.meta as any)?.env?.VITE_TENANT_ID || "")).trim();
+  return (
+    (cfg.tenantId ? String(cfg.tenantId) : "") ||
+    String((import.meta as any)?.env?.VITE_TENANT_ID || "").trim() ||
+    DEFAULT_TENANT_ID
+  ).trim();
 }
 
 function readCompanyId(): string {
   const cfg = readBackendConfig();
-  return ((cfg.companyId ? String(cfg.companyId) : "") || String((import.meta as any)?.env?.VITE_COMPANY_ID || "")).trim();
+  return (
+    (cfg.companyId ? String(cfg.companyId) : "") ||
+    String((import.meta as any)?.env?.VITE_COMPANY_ID || "").trim() ||
+    DEFAULT_COMPANY_ID
+  ).trim();
 }
 
 function setIfMissingOrEmpty(h: Headers, key: string, value: string) {
   if (!value) return;
   const existed = h.get(key);
+  // 不存在 / 空白 / "null" / "undefined" 都强制覆盖
   if (!existed || !String(existed).trim() || existed === "null" || existed === "undefined") {
     h.set(key, value);
   }
@@ -77,7 +92,7 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
     tmp.forEach((v, k) => h.set(k, v));
   }
 
-  // ✅ 强制补齐（即便上层传空也纠正）
+  // ✅ 强制补齐鉴权三件套（即使上层传了空值也纠正）
   setIfMissingOrEmpty(h, "X-User-Id", readUserId());
   setIfMissingOrEmpty(h, "X-Tenant-Id", readTenantId());
   setIfMissingOrEmpty(h, "X-Company-Id", readCompanyId());
@@ -128,7 +143,7 @@ export async function apiFetch<T = any>(url: string, options: ApiFetchOptions = 
       (payload?.message as string) ||
       `HTTP_${res.status}`;
 
-    // ✅ 关键：401/403 时把“实际发出去的头”带出来（手机直接看红字就知道缺哪个）
+    // 401/403 时继续带出最终 headers（方便你验证已不为空）
     let extraHint = "";
     if (res.status === 401 || res.status === 403) {
       extraHint =
