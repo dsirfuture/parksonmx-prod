@@ -1,5 +1,9 @@
+// WorkerScan.tsx  —— 直接整文件替换
+// ✅ 变化点：commitEvidencePicked 改为：presign -> PUT -> commit，证据进 DB，跨设备可见
+// ✅ 语言：仍用你现有 L(zh, es)，弹窗/提示不会出现双语
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Scan, Search, Camera, CheckCircle2, AlertTriangle } from "lucide-react";
+import { Scan, Search, Camera } from "lucide-react";
 import { Header } from "../components/Shared";
 import { getReceiptItems, getReceiptMeta } from "../utils/receiptStorage";
 import { apiFetch } from "../api/http";
@@ -71,15 +75,6 @@ function SummarySquare({ label, value, danger }: { label: string; value: number;
   );
 }
 
-function fileToDataURL(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(String(fr.result || ""));
-    fr.onerror = () => reject(new Error("read_failed"));
-    fr.readAsDataURL(file);
-  });
-}
-
 function ensureDeviceId(): string {
   const key = "psmx_device_id";
   let v = "";
@@ -119,31 +114,12 @@ function mapServerItemsToLocal(arr: any[]) {
   }));
 }
 
-// ✅ 从 localStorage 读取证据（最权威），避免轮询抢跑覆盖
-function readLocalEvidenceMap(receiptId: string) {
-  const mapById = new Map<string, { urls: string[]; checkedAt?: any; lastCheckedAt?: any }>();
-  try {
-    const raw = localStorage.getItem(`parksonmx:receipt:${receiptId}:items`);
-    const arr = raw ? JSON.parse(raw) : [];
-    for (const it of Array.isArray(arr) ? arr : []) {
-      const id = String(it?.id || "");
-      if (!id) continue;
-      const urls = Array.isArray(it?.evidence_photo_urls) ? it.evidence_photo_urls : [];
-      mapById.set(id, { urls, checkedAt: it?.checkedAt, lastCheckedAt: it?.lastCheckedAt });
-    }
-  } catch {}
-  return mapById;
-}
-
-type ModalKind = "DONE" | "NEED_EVIDENCE" | null;
-
 export default function WorkerScan() {
   const receiptId = useMemo(() => getReceiptIdFromHash(), []);
   const receiptNoFromHash = useMemo(() => getReceiptNoFromHash(), []);
   const meta = useMemo(() => (receiptId ? getReceiptMeta(receiptId) : null), [receiptId]);
   const deviceId = useMemo(() => ensureDeviceId(), []);
 
-  // ✅ 扫码页独立语言（不影响其他页面）
   type Lang = "zh" | "es";
   const [lang, setLang] = useState<Lang>(() => {
     try {
@@ -165,63 +141,18 @@ export default function WorkerScan() {
     return (getReceiptItems(receiptId) as any[]) || [];
   });
 
-  // toast（保留给非关键提示）
   const [toast, setToast] = useState<string>("");
   function showToast(msg: string) {
     setToast(msg);
     window.setTimeout(() => setToast(""), 1200);
   }
 
-  // ✅ 新增：漂亮弹窗（关键提示）
-  const [modalOpen, setModalOpen] = useState(false);
-  const [modalKind, setModalKind] = useState<ModalKind>(null);
-  const [modalSku, setModalSku] = useState<string>("");
-  const [modalIndex, setModalIndex] = useState<number | null>(null);
-  const modalTimerRef = useRef<number | null>(null);
-
-  function closeModal() {
-    setModalOpen(false);
-    setModalKind(null);
-    setModalSku("");
-    setModalIndex(null);
-    if (modalTimerRef.current) window.clearTimeout(modalTimerRef.current);
-    modalTimerRef.current = null;
-  }
-
-  function openModal(kind: Exclude<ModalKind, null>, sku: string, indexInAll?: number | null, autoCloseMs = 0) {
-    if (modalTimerRef.current) window.clearTimeout(modalTimerRef.current);
-    setModalKind(kind);
-    setModalSku(sku);
-    setModalIndex(typeof indexInAll === "number" ? indexInAll : null);
-    setModalOpen(true);
-
-    if (autoCloseMs > 0) {
-      modalTimerRef.current = window.setTimeout(() => closeModal(), autoCloseMs);
-    }
-  }
-
-  // ✅ 轮询：只从 localStorage 合并证据（稳定）
   async function loadItemsFromServer(silent?: boolean) {
     if (!receiptId) return;
     try {
       const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items`, { method: "GET" });
       const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
-      const serverMapped = mapServerItemsToLocal(arr);
-
-      const localMap = readLocalEvidenceMap(receiptId);
-
-      const merged = serverMapped.map((s: any) => {
-        const local = localMap.get(String(s.id || ""));
-        const urls = local?.urls?.length ? local.urls.slice(0, 6) : [];
-        return {
-          ...s,
-          evidence_photo_urls: urls.length ? urls : s.evidence_photo_urls,
-          evidence_photo_count: urls.length ? urls.length : s.evidence_photo_count,
-          evidence_count: urls.length ? urls.length : s.evidence_count,
-          checkedAt: local?.checkedAt ?? s.checkedAt,
-          lastCheckedAt: local?.lastCheckedAt ?? s.lastCheckedAt,
-        };
-      });
+      const merged = mapServerItemsToLocal(arr);
 
       const sig = merged
         .map((it: any) => `${it.id}:${it.good_qty}:${it.damaged_qty}:${it.qty}:${(it.evidence_photo_urls || []).length}`)
@@ -250,7 +181,6 @@ export default function WorkerScan() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
 
-  // ✅ 持久化（证据也在这）
   useEffect(() => {
     if (!receiptId) return;
     try {
@@ -265,7 +195,6 @@ export default function WorkerScan() {
   const scanInputRef = useRef<HTMLInputElement | null>(null);
   const [damagedCount, setDamagedCount] = useState<number>(0);
 
-  // 手输条码自动识别
   const autoInputTimerRef = useRef<number | null>(null);
   function scheduleAutoSubmit(val: string) {
     if (autoInputTimerRef.current) window.clearTimeout(autoInputTimerRef.current);
@@ -279,7 +208,6 @@ export default function WorkerScan() {
     }, 450);
   }
 
-  // camera
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
   const [camOn, setCamOn] = useState(false);
@@ -360,12 +288,11 @@ export default function WorkerScan() {
     const idem = makeIdempotencyKey(deviceId);
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
-      headers: { "Idempotency-Key": idem },
+      headers: { "Idempotency-Key": idem, "Content-Type": "application/json" },
       body: JSON.stringify({ barcode, device_id: deviceId, mode }),
     });
   }
 
-  // ✅ 写入验货时间（供证据页显示）
   function stampCheckedAt(idx: number) {
     const now = Date.now();
     setItems((prev) => {
@@ -391,8 +318,10 @@ export default function WorkerScan() {
       cur.locked = !!updated.locked;
       cur.status = updated.status ?? cur.status;
       cur.version = updated.version ?? cur.version;
-      cur.checkedAt = cur.checkedAt ?? updated.checked_at ?? updated.checkedAt;
-      cur.lastCheckedAt = updated.last_checked_at ?? updated.lastCheckedAt ?? cur.lastCheckedAt;
+
+      // ✅ 关键：后端会回填 evidence_photo_urls / evidence_count
+      if (Array.isArray(updated.evidence_photo_urls)) cur.evidence_photo_urls = updated.evidence_photo_urls;
+      if (updated.evidence_count != null) cur.evidence_count = toInt(updated.evidence_count);
 
       next[idx] = cur;
       return next;
@@ -439,67 +368,6 @@ export default function WorkerScan() {
 
   const displayDocNo = receiptNoFromHash || meta?.receiptNo || receiptId || "—";
 
-  // ✅ 证据上传后强制切 Tab（用 ref 解决 setState 时序）
-  const afterEvidenceTabRef = useRef<TabKey | null>(null);
-
-  const photoInputRef = useRef<HTMLInputElement | null>(null);
-  const [eviTargetIndex, setEviTargetIndex] = useState<number | null>(null);
-
-  function openEvidencePicker(index: number) {
-    setEviTargetIndex(index);
-    requestAnimationFrame(() => photoInputRef.current?.click());
-  }
-
-  async function commitEvidencePicked(files: FileList | null) {
-    if (!files || files.length === 0) return;
-    if (eviTargetIndex === null) return;
-
-    const fileArr = Array.from(files);
-    try {
-      const dataUrls = await Promise.all(fileArr.map((f) => fileToDataURL(f)));
-
-      afterEvidenceTabRef.current = null;
-
-      setItems((prev) => {
-        const next = [...prev];
-        const it = { ...next[eviTargetIndex] };
-
-        const photoUrls: string[] = Array.isArray(it.evidence_photo_urls) ? [...it.evidence_photo_urls] : [];
-        for (const u of dataUrls) photoUrls.push(u);
-
-        it.evidence_photo_urls = photoUrls.slice(0, 6);
-        it.evidence_photo_count = it.evidence_photo_urls.length;
-        it.evidence_count = toInt(it.evidence_photo_count);
-
-        const now = Date.now();
-        if (!it.checkedAt) it.checkedAt = now;
-        it.lastCheckedAt = now;
-
-        next[eviTargetIndex] = it;
-
-        const expected = toInt(it.qty);
-        const done = toInt(it.good_qty) + toInt(it.damaged_qty);
-        const isDone = expected > 0 && done >= expected && it.evidence_photo_urls.length > 0;
-        afterEvidenceTabRef.current = isDone ? "done" : "doing";
-
-        try {
-          localStorage.setItem(`parksonmx:receipt:${receiptId}:items`, JSON.stringify(next));
-        } catch {}
-
-        return next;
-      });
-
-      showToast(L("已保存证据", "Guardado"));
-
-      requestAnimationFrame(() => {
-        const nextTab = afterEvidenceTabRef.current;
-        if (nextTab) setTab(nextTab);
-      });
-    } catch {
-      showToast(L("证据保存失败", "Error foto"));
-    }
-  }
-
   async function smartSubmit(raw: string, source: "autoBarcode" | "manual") {
     const v = norm(raw);
     if (!v) return;
@@ -516,25 +384,21 @@ export default function WorkerScan() {
     }
 
     const it = items[idx];
-    const sku = String(it?.sku || "-");
     const expected = toInt(it?.qty);
-    const doneBefore = toInt(it?.good_qty) + toInt(it?.damaged_qty);
+    const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
+    const remain = Math.max(0, expected - done);
 
-    const photoCountBefore = Array.isArray(it?.evidence_photo_urls)
+    const photoCount = Array.isArray(it?.evidence_photo_urls)
       ? it.evidence_photo_urls.length
       : toInt(it?.evidence_photo_count ?? it?.evidence_count);
 
-    // ✅ 规则 1：如果已经“数量完成”，再次扫同 SKU -> 弹窗“验货完毕”
-    if (expected > 0 && doneBefore >= expected) {
-      // 如果还缺证据，也给一个“去拍照”按钮（不强制，但更友好）
-      if (photoCountBefore <= 0) openModal("NEED_EVIDENCE", sku, idx, 0);
-      else openModal("DONE", sku, idx, 1600);
+    if (expected > 0 && done >= expected) {
+      showToast(photoCount > 0 ? L("验货完毕", "Completado") : L("请添加证据", "Falta foto"));
       setScanInput("");
       setDamagedCount(0);
       return;
     }
 
-    const remain = Math.max(0, expected - doneBefore);
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
     const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
 
@@ -550,26 +414,6 @@ export default function WorkerScan() {
       } else {
         const res = await postScanIncrement(it.barcode, "good");
         if (res?.item) applyServerItemToLocal(res.item);
-      }
-
-      // ✅ 规则 2：如果这一次操作后刚好“数量完成”，弹窗提示“请添加证据”（若缺证据）
-      // 用本地 items 可能有时序，所以用“预估完成”判断：doneBefore + 本次增加 >= expected
-      const added = timesDamaged > 0 ? timesDamaged : 1;
-      const doneAfter = doneBefore + added;
-
-      const localAfter = items[idx]; // 这里可能还没来得及被 setItems 更新，但不影响“完成提示”的判定
-      const photoCountAfter = Array.isArray(localAfter?.evidence_photo_urls)
-        ? localAfter.evidence_photo_urls.length
-        : toInt(localAfter?.evidence_photo_count ?? localAfter?.evidence_count);
-
-      const becameCompleted = expected > 0 && doneBefore < expected && doneAfter >= expected;
-
-      if (becameCompleted) {
-        if (photoCountAfter <= 0) {
-          openModal("NEED_EVIDENCE", sku, idx, 0);
-        } else {
-          openModal("DONE", sku, idx, 1600);
-        }
       }
     } catch {
       showToast(L("网络/接口错误", "Error red/API"));
@@ -607,6 +451,93 @@ export default function WorkerScan() {
     return list.filter((it) => itemStatus(it) === "已完成");
   }, [items, q, tab]);
 
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const [eviTargetIndex, setEviTargetIndex] = useState<number | null>(null);
+
+  function openEvidencePicker(index: number) {
+    setEviTargetIndex(index);
+    requestAnimationFrame(() => photoInputRef.current?.click());
+  }
+
+  // ✅ 核心：证据必须进后端，跨设备才一致
+  async function commitEvidencePicked(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    if (eviTargetIndex === null) return;
+
+    const target = items[eviTargetIndex];
+    const itemId = String(target?.id || "");
+    if (!itemId) {
+      showToast(L("缺少 itemId", "Falta itemId"));
+      return;
+    }
+
+    const fileArr = Array.from(files).slice(0, 6);
+
+    try {
+      for (const file of fileArr) {
+        const presignRes = await apiFetch<any>(
+          `/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}/evidence/presign`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name,
+              content_type: file.type || "application/octet-stream",
+              file_size: file.size,
+              type: "photo",
+            }),
+          }
+        );
+
+        const p = presignRes?.data ?? presignRes;
+        const uploadUrl = p?.upload_url || p?.uploadUrl || p?.url || p?.put_url || p?.putUrl;
+        const fileUrl = p?.file_url || p?.fileUrl || p?.public_url || p?.publicUrl || p?.key;
+
+        if (!uploadUrl || !fileUrl) throw new Error("presign_invalid");
+
+        const putRes = await fetch(uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (!putRes.ok) throw new Error("upload_failed");
+
+        const idem = makeIdempotencyKey(deviceId);
+        const commitRes = await apiFetch<any>(
+          `/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}/evidence/commit`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
+            body: JSON.stringify({
+              type: "photo",
+              file_url: fileUrl,
+              mime_type: file.type || "application/octet-stream",
+              file_size: file.size,
+            }),
+          }
+        );
+
+        const updatedItem = commitRes?.data?.item ?? commitRes?.item ?? commitRes?.data ?? null;
+        if (updatedItem?.id) applyServerItemToLocal(updatedItem);
+      }
+
+      await loadItemsFromServer(true);
+      showToast(L("证据已上传", "Foto subida"));
+
+      // 上传证据后，自动切 Tab
+      const latest = items.find((x: any) => String(x?.id) === itemId) || target;
+      const expected = toInt(latest?.qty);
+      const done = toInt(latest?.good_qty) + toInt(latest?.damaged_qty);
+      const photoCount = Array.isArray(latest?.evidence_photo_urls)
+        ? latest.evidence_photo_urls.length
+        : toInt(latest?.evidence_photo_count ?? latest?.evidence_count);
+      const isDone = expected > 0 && done >= expected && photoCount > 0;
+      setTab(isDone ? "done" : "doing");
+    } catch {
+      showToast(L("证据上传失败", "Error foto"));
+    }
+  }
+
   const ring = useMemo(() => {
     const r = 16;
     const c = 2 * Math.PI * r;
@@ -622,25 +553,11 @@ export default function WorkerScan() {
     return "bg-[#FBEAEB] border-[#FBEAEB] text-[#2F3C7E]";
   };
 
-  // 弹窗文案（单语言）
-  const modalTitle = useMemo(() => {
-    if (!modalKind) return "";
-    if (modalKind === "DONE") return L("验货完毕", "Cantidad completada");
-    return L("请添加证据", "Agrega evidencia");
-  }, [modalKind, lang]);
-
-  const modalSub = useMemo(() => {
-    if (!modalKind) return "";
-    if (modalKind === "DONE") return L("该SKU数量已完成", "Este SKU ya está completo");
-    return L("数量已完成，但缺少证据照片", "Cantidad completa, pero falta evidencia");
-  }, [modalKind, lang]);
-
   return (
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col">
       <Header title={L("扫码验货", "Escanear")} hideBack />
 
       <div className="w-full max-w-[430px] mx-auto px-4 pt-4">
-        {/* 语言开关 */}
         <div className="flex items-center justify-end mb-3">
           <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
             <button
@@ -687,15 +604,7 @@ export default function WorkerScan() {
           >
             <video
               ref={videoRef}
-              style={{
-                position: "absolute",
-                inset: 0,
-                width: "100%",
-                height: "100%",
-                objectFit: "cover",
-                display: "block",
-                background: "#F4F6FA",
-              }}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", display: "block", background: "#F4F6FA" }}
               className={camOn ? "opacity-100" : "opacity-0"}
               muted
               playsInline
@@ -776,7 +685,6 @@ export default function WorkerScan() {
         </div>
       </div>
 
-      {/* Bottom Sheet */}
       <div className="mt-3 px-4 flex-1 flex">
         <section className="w-full max-w-[430px] mx-auto bg-white rounded-t-[32px] border border-slate-200 shadow-[0_-8px_30px_rgba(0,0,0,0.05)] pt-2 pb-7 flex-1 overflow-y-auto">
           <div className="w-12 h-1.5 bg-slate-100 rounded-full mx-auto my-4" />
@@ -930,73 +838,6 @@ export default function WorkerScan() {
         className="absolute -left-[9999px] -top-[9999px] opacity-0 w-px h-px"
         onChange={(e) => commitEvidencePicked(e.target.files)}
       />
-
-      {/* 弹窗（只显示当前语言） */}
-      {modalOpen && modalKind ? (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/40" onClick={closeModal} />
-          <div className="relative w-[92%] max-w-[420px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
-            <div className="px-4 pt-4 pb-3 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                {modalKind === "DONE" ? (
-                  <CheckCircle2 className="w-5 h-5 text-[#2E7D32]" />
-                ) : (
-                  <AlertTriangle className="w-5 h-5 text-[#D32F2F]" />
-                )}
-                <div className="text-[16px] font-extrabold text-slate-900">{modalTitle}</div>
-              </div>
-              <button
-                type="button"
-                onClick={closeModal}
-                className="w-9 h-9 rounded-full bg-white border border-slate-200 flex items-center justify-center active:scale-[0.99]"
-              >
-                <span className="material-symbols-outlined text-[20px] text-slate-600">close</span>
-              </button>
-            </div>
-
-            <div className="px-4 pb-4">
-              <div className="bg-[#F4F6FA] border border-slate-200 rounded-2xl p-4">
-                <div className="text-[12px] text-slate-500 font-semibold">{L("SKU", "SKU")}</div>
-                <div className="mt-1 text-[16px] font-extrabold text-[#2F3C7E] break-all">{modalSku || "-"}</div>
-                <div className="mt-2 text-[12px] text-slate-700 font-semibold leading-6">{modalSub}</div>
-              </div>
-
-              <div className="mt-4 flex gap-3">
-                {modalKind === "NEED_EVIDENCE" && typeof modalIndex === "number" ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      closeModal();
-                      openEvidencePicker(modalIndex);
-                    }}
-                    className="flex-1 h-11 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
-                  >
-                    {L("去拍照", "Tomar foto")}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={closeModal}
-                    className="flex-1 h-11 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
-                  >
-                    {L("知道了", "Entendido")}
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  onClick={closeModal}
-                  className="flex-1 h-11 rounded-2xl bg-white border border-slate-200 text-slate-700 font-extrabold active:scale-[0.98]"
-                >
-                  {L("关闭", "Cerrar")}
-                </button>
-              </div>
-
-              <div className="mt-4 text-center text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</div>
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       {toast ? (
         <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-50">
