@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Scan, Search, Camera } from "lucide-react";
+import { Scan, Search, Camera, CheckCircle2, AlertTriangle } from "lucide-react";
 import { Header } from "../components/Shared";
 import { getReceiptItems, getReceiptMeta } from "../utils/receiptStorage";
 import { apiFetch } from "../api/http";
@@ -135,7 +135,7 @@ function readLocalEvidenceMap(receiptId: string) {
   return mapById;
 }
 
-type Lang = "zh" | "es";
+type ModalKind = "DONE" | "NEED_EVIDENCE" | null;
 
 export default function WorkerScan() {
   const receiptId = useMemo(() => getReceiptIdFromHash(), []);
@@ -144,6 +144,7 @@ export default function WorkerScan() {
   const deviceId = useMemo(() => ensureDeviceId(), []);
 
   // ✅ 扫码页独立语言（不影响其他页面）
+  type Lang = "zh" | "es";
   const [lang, setLang] = useState<Lang>(() => {
     try {
       const v = localStorage.getItem("parksonmx:worker:scan_lang");
@@ -164,42 +165,39 @@ export default function WorkerScan() {
     return (getReceiptItems(receiptId) as any[]) || [];
   });
 
-  // toast
+  // toast（保留给非关键提示）
   const [toast, setToast] = useState<string>("");
   function showToast(msg: string) {
     setToast(msg);
     window.setTimeout(() => setToast(""), 1200);
   }
 
-  // ✅ 新增：弹窗（只显示当前语言）
+  // ✅ 新增：漂亮弹窗（关键提示）
   const [modalOpen, setModalOpen] = useState(false);
-  const [modalTitle, setModalTitle] = useState("");
-  const [modalDesc, setModalDesc] = useState<string | null>(null);
-  const [modalPrimaryText, setModalPrimaryText] = useState<string>("OK");
-  const [modalSecondaryText, setModalSecondaryText] = useState<string | null>(null);
-  const modalPrimaryActionRef = useRef<(() => void) | null>(null);
-  const modalSecondaryActionRef = useRef<(() => void) | null>(null);
+  const [modalKind, setModalKind] = useState<ModalKind>(null);
+  const [modalSku, setModalSku] = useState<string>("");
+  const [modalIndex, setModalIndex] = useState<number | null>(null);
+  const modalTimerRef = useRef<number | null>(null);
 
   function closeModal() {
     setModalOpen(false);
-    modalPrimaryActionRef.current = null;
-    modalSecondaryActionRef.current = null;
+    setModalKind(null);
+    setModalSku("");
+    setModalIndex(null);
+    if (modalTimerRef.current) window.clearTimeout(modalTimerRef.current);
+    modalTimerRef.current = null;
   }
-  function openModal(opts: {
-    title: string;
-    desc?: string | null;
-    primaryText?: string;
-    primaryAction?: () => void;
-    secondaryText?: string | null;
-    secondaryAction?: () => void;
-  }) {
-    setModalTitle(opts.title);
-    setModalDesc(opts.desc ?? null);
-    setModalPrimaryText(opts.primaryText ?? "OK");
-    setModalSecondaryText(opts.secondaryText ?? null);
-    modalPrimaryActionRef.current = opts.primaryAction ?? null;
-    modalSecondaryActionRef.current = opts.secondaryAction ?? null;
+
+  function openModal(kind: Exclude<ModalKind, null>, sku: string, indexInAll?: number | null, autoCloseMs = 0) {
+    if (modalTimerRef.current) window.clearTimeout(modalTimerRef.current);
+    setModalKind(kind);
+    setModalSku(sku);
+    setModalIndex(typeof indexInAll === "number" ? indexInAll : null);
     setModalOpen(true);
+
+    if (autoCloseMs > 0) {
+      modalTimerRef.current = window.setTimeout(() => closeModal(), autoCloseMs);
+    }
   }
 
   // ✅ 轮询：只从 localStorage 合并证据（稳定）
@@ -277,7 +275,6 @@ export default function WorkerScan() {
     if (!raw) return;
 
     autoInputTimerRef.current = window.setTimeout(() => {
-      // 自动只在“看起来像条码”时触发（避免 SKU 误触）
       if (looksLikeNumericBarcode(raw)) smartSubmit(raw, "autoBarcode");
     }, 450);
   }
@@ -474,20 +471,17 @@ export default function WorkerScan() {
         it.evidence_photo_count = it.evidence_photo_urls.length;
         it.evidence_count = toInt(it.evidence_photo_count);
 
-        // 上传证据也更新时间
         const now = Date.now();
         if (!it.checkedAt) it.checkedAt = now;
         it.lastCheckedAt = now;
 
         next[eviTargetIndex] = it;
 
-        // ✅ 在同一次更新里判断是否完成，并写入 ref（避免异步拿不到）
         const expected = toInt(it.qty);
         const done = toInt(it.good_qty) + toInt(it.damaged_qty);
         const isDone = expected > 0 && done >= expected && it.evidence_photo_urls.length > 0;
         afterEvidenceTabRef.current = isDone ? "done" : "doing";
 
-        // ✅ 立即写入 localStorage，防轮询抢跑
         try {
           localStorage.setItem(`parksonmx:receipt:${receiptId}:items`, JSON.stringify(next));
         } catch {}
@@ -497,7 +491,6 @@ export default function WorkerScan() {
 
       showToast(L("已保存证据", "Guardado"));
 
-      // ✅ 下一帧执行 Tab 切换（稳定，不闪回）
       requestAnimationFrame(() => {
         const nextTab = afterEvidenceTabRef.current;
         if (nextTab) setTab(nextTab);
@@ -507,7 +500,6 @@ export default function WorkerScan() {
     }
   }
 
-  // ✅ 核心：智能扫码提交 + 完毕/证据弹窗
   async function smartSubmit(raw: string, source: "autoBarcode" | "manual") {
     const v = norm(raw);
     if (!v) return;
@@ -524,42 +516,25 @@ export default function WorkerScan() {
     }
 
     const it = items[idx];
+    const sku = String(it?.sku || "-");
     const expected = toInt(it?.qty);
-    const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
-    const remain = Math.max(0, expected - done);
+    const doneBefore = toInt(it?.good_qty) + toInt(it?.damaged_qty);
 
-    const photoCount = Array.isArray(it?.evidence_photo_urls)
+    const photoCountBefore = Array.isArray(it?.evidence_photo_urls)
       ? it.evidence_photo_urls.length
       : toInt(it?.evidence_photo_count ?? it?.evidence_count);
 
-    // ✅ 已经验完：再次扫同样 SKU → 弹窗“验货完毕”，若缺证据 → 提示去拍照
-    if (expected > 0 && done >= expected) {
-      if (photoCount > 0) {
-        openModal({
-          title: L("验货完毕", "Cantidad completada"),
-          desc: L("该 SKU 已验完，无需重复扫码。", "Este SKU ya está completo. No es necesario escanear de nuevo."),
-          primaryText: L("知道了", "Entendido"),
-          primaryAction: () => closeModal(),
-        });
-      } else {
-        openModal({
-          title: L("验货完毕", "Cantidad completada"),
-          desc: L("该 SKU 已验完，但还没有证据。请添加证据。", "El SKU está completo, pero falta evidencia. Por favor agrega evidencia."),
-          primaryText: L("去拍照", "Tomar foto"),
-          primaryAction: () => {
-            closeModal();
-            openEvidencePicker(idx);
-          },
-          secondaryText: L("稍后", "Luego"),
-          secondaryAction: () => closeModal(),
-        });
-      }
-
+    // ✅ 规则 1：如果已经“数量完成”，再次扫同 SKU -> 弹窗“验货完毕”
+    if (expected > 0 && doneBefore >= expected) {
+      // 如果还缺证据，也给一个“去拍照”按钮（不强制，但更友好）
+      if (photoCountBefore <= 0) openModal("NEED_EVIDENCE", sku, idx, 0);
+      else openModal("DONE", sku, idx, 1600);
       setScanInput("");
       setDamagedCount(0);
       return;
     }
 
+    const remain = Math.max(0, expected - doneBefore);
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
     const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
 
@@ -577,33 +552,23 @@ export default function WorkerScan() {
         if (res?.item) applyServerItemToLocal(res.item);
       }
 
-      // ✅ 本次扫码后：如果刚好验完且缺证据 → 弹窗“请添加证据”
-      // 这里用“本地预估”来判断：done + 本次增量 是否 >= expected
-      const inc = timesDamaged > 0 ? timesDamaged : 1;
-      const doneAfter = Math.min(expected, done + inc);
-      const justCompleted = expected > 0 && doneAfter >= expected;
+      // ✅ 规则 2：如果这一次操作后刚好“数量完成”，弹窗提示“请添加证据”（若缺证据）
+      // 用本地 items 可能有时序，所以用“预估完成”判断：doneBefore + 本次增加 >= expected
+      const added = timesDamaged > 0 ? timesDamaged : 1;
+      const doneAfter = doneBefore + added;
 
-      if (justCompleted) {
-        // 注意：证据数量仍以“当前 it 的 photoCount”为准（一般此时还是 0）
-        if (photoCount <= 0) {
-          openModal({
-            title: L("请添加证据", "Por favor agrega evidencia"),
-            desc: L("该 SKU 数量已验完，请马上拍照上传证据。", "La cantidad está completa. Por favor toma una foto como evidencia."),
-            primaryText: L("去拍照", "Tomar foto"),
-            primaryAction: () => {
-              closeModal();
-              openEvidencePicker(idx);
-            },
-            secondaryText: L("稍后", "Luego"),
-            secondaryAction: () => closeModal(),
-          });
+      const localAfter = items[idx]; // 这里可能还没来得及被 setItems 更新，但不影响“完成提示”的判定
+      const photoCountAfter = Array.isArray(localAfter?.evidence_photo_urls)
+        ? localAfter.evidence_photo_urls.length
+        : toInt(localAfter?.evidence_photo_count ?? localAfter?.evidence_count);
+
+      const becameCompleted = expected > 0 && doneBefore < expected && doneAfter >= expected;
+
+      if (becameCompleted) {
+        if (photoCountAfter <= 0) {
+          openModal("NEED_EVIDENCE", sku, idx, 0);
         } else {
-          openModal({
-            title: L("验货完毕", "Cantidad completada"),
-            desc: L("该 SKU 数量已验完。", "La cantidad del SKU está completa."),
-            primaryText: L("知道了", "Entendido"),
-            primaryAction: () => closeModal(),
-          });
+          openModal("DONE", sku, idx, 1600);
         }
       }
     } catch {
@@ -657,12 +622,25 @@ export default function WorkerScan() {
     return "bg-[#FBEAEB] border-[#FBEAEB] text-[#2F3C7E]";
   };
 
+  // 弹窗文案（单语言）
+  const modalTitle = useMemo(() => {
+    if (!modalKind) return "";
+    if (modalKind === "DONE") return L("验货完毕", "Cantidad completada");
+    return L("请添加证据", "Agrega evidencia");
+  }, [modalKind, lang]);
+
+  const modalSub = useMemo(() => {
+    if (!modalKind) return "";
+    if (modalKind === "DONE") return L("该SKU数量已完成", "Este SKU ya está completo");
+    return L("数量已完成，但缺少证据照片", "Cantidad completa, pero falta evidencia");
+  }, [modalKind, lang]);
+
   return (
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col">
       <Header title={L("扫码验货", "Escanear")} hideBack />
 
       <div className="w-full max-w-[430px] mx-auto px-4 pt-4">
-        {/* ✅ 语言开关 */}
+        {/* 语言开关 */}
         <div className="flex items-center justify-end mb-3">
           <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
             <button
@@ -953,42 +931,68 @@ export default function WorkerScan() {
         onChange={(e) => commitEvidencePicked(e.target.files)}
       />
 
-      {/* ✅ 弹窗（更明显，不闪） */}
-      {modalOpen ? (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center px-4">
+      {/* 弹窗（只显示当前语言） */}
+      {modalOpen && modalKind ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
           <div className="absolute inset-0 bg-black/40" onClick={closeModal} />
-          <div className="relative w-full max-w-[420px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
-            <div className="px-4 pt-4 pb-3">
-              <div className="text-[16px] font-extrabold text-slate-900">{modalTitle}</div>
-              {modalDesc ? <div className="mt-2 text-[13px] font-semibold text-slate-600 leading-6">{modalDesc}</div> : null}
-            </div>
-
-            <div className="px-4 pb-4 flex gap-3 justify-end">
-              {modalSecondaryText ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const fn = modalSecondaryActionRef.current;
-                    closeModal();
-                    fn?.();
-                  }}
-                  className="h-10 px-4 rounded-2xl bg-white border border-slate-200 text-slate-700 font-extrabold active:scale-[0.98]"
-                >
-                  {modalSecondaryText}
-                </button>
-              ) : null}
-
+          <div className="relative w-[92%] max-w-[420px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            <div className="px-4 pt-4 pb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                {modalKind === "DONE" ? (
+                  <CheckCircle2 className="w-5 h-5 text-[#2E7D32]" />
+                ) : (
+                  <AlertTriangle className="w-5 h-5 text-[#D32F2F]" />
+                )}
+                <div className="text-[16px] font-extrabold text-slate-900">{modalTitle}</div>
+              </div>
               <button
                 type="button"
-                onClick={() => {
-                  const fn = modalPrimaryActionRef.current;
-                  closeModal();
-                  fn?.();
-                }}
-                className="h-10 px-4 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
+                onClick={closeModal}
+                className="w-9 h-9 rounded-full bg-white border border-slate-200 flex items-center justify-center active:scale-[0.99]"
               >
-                {modalPrimaryText}
+                <span className="material-symbols-outlined text-[20px] text-slate-600">close</span>
               </button>
+            </div>
+
+            <div className="px-4 pb-4">
+              <div className="bg-[#F4F6FA] border border-slate-200 rounded-2xl p-4">
+                <div className="text-[12px] text-slate-500 font-semibold">{L("SKU", "SKU")}</div>
+                <div className="mt-1 text-[16px] font-extrabold text-[#2F3C7E] break-all">{modalSku || "-"}</div>
+                <div className="mt-2 text-[12px] text-slate-700 font-semibold leading-6">{modalSub}</div>
+              </div>
+
+              <div className="mt-4 flex gap-3">
+                {modalKind === "NEED_EVIDENCE" && typeof modalIndex === "number" ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeModal();
+                      openEvidencePicker(modalIndex);
+                    }}
+                    className="flex-1 h-11 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
+                  >
+                    {L("去拍照", "Tomar foto")}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={closeModal}
+                    className="flex-1 h-11 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
+                  >
+                    {L("知道了", "Entendido")}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={closeModal}
+                  className="flex-1 h-11 rounded-2xl bg-white border border-slate-200 text-slate-700 font-extrabold active:scale-[0.98]"
+                >
+                  {L("关闭", "Cerrar")}
+                </button>
+              </div>
+
+              <div className="mt-4 text-center text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</div>
             </div>
           </div>
         </div>
