@@ -135,6 +135,8 @@ function readLocalEvidenceMap(receiptId: string) {
   return mapById;
 }
 
+type Lang = "zh" | "es";
+
 export default function WorkerScan() {
   const receiptId = useMemo(() => getReceiptIdFromHash(), []);
   const receiptNoFromHash = useMemo(() => getReceiptNoFromHash(), []);
@@ -142,7 +144,6 @@ export default function WorkerScan() {
   const deviceId = useMemo(() => ensureDeviceId(), []);
 
   // ✅ 扫码页独立语言（不影响其他页面）
-  type Lang = "zh" | "es";
   const [lang, setLang] = useState<Lang>(() => {
     try {
       const v = localStorage.getItem("parksonmx:worker:scan_lang");
@@ -168,6 +169,37 @@ export default function WorkerScan() {
   function showToast(msg: string) {
     setToast(msg);
     window.setTimeout(() => setToast(""), 1200);
+  }
+
+  // ✅ 新增：弹窗（只显示当前语言）
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalTitle, setModalTitle] = useState("");
+  const [modalDesc, setModalDesc] = useState<string | null>(null);
+  const [modalPrimaryText, setModalPrimaryText] = useState<string>("OK");
+  const [modalSecondaryText, setModalSecondaryText] = useState<string | null>(null);
+  const modalPrimaryActionRef = useRef<(() => void) | null>(null);
+  const modalSecondaryActionRef = useRef<(() => void) | null>(null);
+
+  function closeModal() {
+    setModalOpen(false);
+    modalPrimaryActionRef.current = null;
+    modalSecondaryActionRef.current = null;
+  }
+  function openModal(opts: {
+    title: string;
+    desc?: string | null;
+    primaryText?: string;
+    primaryAction?: () => void;
+    secondaryText?: string | null;
+    secondaryAction?: () => void;
+  }) {
+    setModalTitle(opts.title);
+    setModalDesc(opts.desc ?? null);
+    setModalPrimaryText(opts.primaryText ?? "OK");
+    setModalSecondaryText(opts.secondaryText ?? null);
+    modalPrimaryActionRef.current = opts.primaryAction ?? null;
+    modalSecondaryActionRef.current = opts.secondaryAction ?? null;
+    setModalOpen(true);
   }
 
   // ✅ 轮询：只从 localStorage 合并证据（稳定）
@@ -410,89 +442,6 @@ export default function WorkerScan() {
 
   const displayDocNo = receiptNoFromHash || meta?.receiptNo || receiptId || "—";
 
-  async function smartSubmit(raw: string, source: "autoBarcode" | "manual") {
-    const v = norm(raw);
-    if (!v) return;
-
-    const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
-    const idxBySku = source === "manual" ? items.findIndex((it) => norm(it?.sku) === v) : -1;
-    const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
-
-    if (idx === -1) {
-      setScanInput("");
-      setDamagedCount(0);
-      showToast(L("未匹配商品", "Sin producto"));
-      return;
-    }
-
-    const it = items[idx];
-    const expected = toInt(it?.qty);
-    const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
-    const remain = Math.max(0, expected - done);
-
-    const photoCount = Array.isArray(it?.evidence_photo_urls)
-      ? it.evidence_photo_urls.length
-      : toInt(it?.evidence_photo_count ?? it?.evidence_count);
-
-    if (expected > 0 && done >= expected) {
-      showToast(photoCount > 0 ? L("已完成", "Hecho") : L("缺证据", "Falta foto"));
-      setScanInput("");
-      setDamagedCount(0);
-      return;
-    }
-
-    const wantDamaged = Math.max(0, Math.floor(damagedCount));
-    const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
-
-    stampCheckedAt(idx);
-
-    try {
-      if (timesDamaged > 0) {
-        for (let i = 0; i < timesDamaged; i++) {
-          const res = await postScanIncrement(it.barcode, "damaged");
-          if (res?.item) applyServerItemToLocal(res.item);
-        }
-        showToast(`${L("破损", "Daño")} +${timesDamaged}`);
-      } else {
-        const res = await postScanIncrement(it.barcode, "good");
-        if (res?.item) applyServerItemToLocal(res.item);
-      }
-    } catch {
-      showToast(L("网络/接口错误", "Error red/API"));
-    } finally {
-      setScanInput("");
-      setDamagedCount(0);
-      setTimeout(() => scanInputRef.current?.focus(), 0);
-    }
-  }
-
-  const filteredItems = useMemo(() => {
-    const kw = norm(q);
-    let list = items.filter((it) => {
-      if (!kw) return true;
-      const hay = `${norm(it?.sku)} ${norm(it?.barcode)} ${norm(it?.name_zh ?? it?.name)} ${norm(it?.name_es ?? "")}`;
-      return hay.includes(kw);
-    });
-
-    list = list.sort((a, b) => {
-      const sa = itemStatus(a);
-      const sb = itemStatus(b);
-      const rank = (s: string) => (s === "未验货" ? 0 : s === "验货中" || s === "待证据" ? 1 : 2);
-      const ra = rank(sa);
-      const rb = rank(sb);
-      if (ra !== rb) return ra - rb;
-      return String(a?.sku || "").localeCompare(String(b?.sku || ""));
-    });
-
-    if (tab === "pending") return list.filter((it) => itemStatus(it) === "未验货");
-    if (tab === "doing")
-      return list.filter((it) => {
-        const s = itemStatus(it);
-        return s === "验货中" || s === "待证据";
-      });
-    return list.filter((it) => itemStatus(it) === "已完成");
-  }, [items, q, tab]);
-
   // ✅ 证据上传后强制切 Tab（用 ref 解决 setState 时序）
   const afterEvidenceTabRef = useRef<TabKey | null>(null);
 
@@ -558,6 +507,141 @@ export default function WorkerScan() {
     }
   }
 
+  // ✅ 核心：智能扫码提交 + 完毕/证据弹窗
+  async function smartSubmit(raw: string, source: "autoBarcode" | "manual") {
+    const v = norm(raw);
+    if (!v) return;
+
+    const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
+    const idxBySku = source === "manual" ? items.findIndex((it) => norm(it?.sku) === v) : -1;
+    const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
+
+    if (idx === -1) {
+      setScanInput("");
+      setDamagedCount(0);
+      showToast(L("未匹配商品", "Sin producto"));
+      return;
+    }
+
+    const it = items[idx];
+    const expected = toInt(it?.qty);
+    const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
+    const remain = Math.max(0, expected - done);
+
+    const photoCount = Array.isArray(it?.evidence_photo_urls)
+      ? it.evidence_photo_urls.length
+      : toInt(it?.evidence_photo_count ?? it?.evidence_count);
+
+    // ✅ 已经验完：再次扫同样 SKU → 弹窗“验货完毕”，若缺证据 → 提示去拍照
+    if (expected > 0 && done >= expected) {
+      if (photoCount > 0) {
+        openModal({
+          title: L("验货完毕", "Cantidad completada"),
+          desc: L("该 SKU 已验完，无需重复扫码。", "Este SKU ya está completo. No es necesario escanear de nuevo."),
+          primaryText: L("知道了", "Entendido"),
+          primaryAction: () => closeModal(),
+        });
+      } else {
+        openModal({
+          title: L("验货完毕", "Cantidad completada"),
+          desc: L("该 SKU 已验完，但还没有证据。请添加证据。", "El SKU está completo, pero falta evidencia. Por favor agrega evidencia."),
+          primaryText: L("去拍照", "Tomar foto"),
+          primaryAction: () => {
+            closeModal();
+            openEvidencePicker(idx);
+          },
+          secondaryText: L("稍后", "Luego"),
+          secondaryAction: () => closeModal(),
+        });
+      }
+
+      setScanInput("");
+      setDamagedCount(0);
+      return;
+    }
+
+    const wantDamaged = Math.max(0, Math.floor(damagedCount));
+    const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
+
+    stampCheckedAt(idx);
+
+    try {
+      if (timesDamaged > 0) {
+        for (let i = 0; i < timesDamaged; i++) {
+          const res = await postScanIncrement(it.barcode, "damaged");
+          if (res?.item) applyServerItemToLocal(res.item);
+        }
+        showToast(`${L("破损", "Daño")} +${timesDamaged}`);
+      } else {
+        const res = await postScanIncrement(it.barcode, "good");
+        if (res?.item) applyServerItemToLocal(res.item);
+      }
+
+      // ✅ 本次扫码后：如果刚好验完且缺证据 → 弹窗“请添加证据”
+      // 这里用“本地预估”来判断：done + 本次增量 是否 >= expected
+      const inc = timesDamaged > 0 ? timesDamaged : 1;
+      const doneAfter = Math.min(expected, done + inc);
+      const justCompleted = expected > 0 && doneAfter >= expected;
+
+      if (justCompleted) {
+        // 注意：证据数量仍以“当前 it 的 photoCount”为准（一般此时还是 0）
+        if (photoCount <= 0) {
+          openModal({
+            title: L("请添加证据", "Por favor agrega evidencia"),
+            desc: L("该 SKU 数量已验完，请马上拍照上传证据。", "La cantidad está completa. Por favor toma una foto como evidencia."),
+            primaryText: L("去拍照", "Tomar foto"),
+            primaryAction: () => {
+              closeModal();
+              openEvidencePicker(idx);
+            },
+            secondaryText: L("稍后", "Luego"),
+            secondaryAction: () => closeModal(),
+          });
+        } else {
+          openModal({
+            title: L("验货完毕", "Cantidad completada"),
+            desc: L("该 SKU 数量已验完。", "La cantidad del SKU está completa."),
+            primaryText: L("知道了", "Entendido"),
+            primaryAction: () => closeModal(),
+          });
+        }
+      }
+    } catch {
+      showToast(L("网络/接口错误", "Error red/API"));
+    } finally {
+      setScanInput("");
+      setDamagedCount(0);
+      setTimeout(() => scanInputRef.current?.focus(), 0);
+    }
+  }
+
+  const filteredItems = useMemo(() => {
+    const kw = norm(q);
+    let list = items.filter((it) => {
+      if (!kw) return true;
+      const hay = `${norm(it?.sku)} ${norm(it?.barcode)} ${norm(it?.name_zh ?? it?.name)} ${norm(it?.name_es ?? "")}`;
+      return hay.includes(kw);
+    });
+
+    list = list.sort((a, b) => {
+      const sa = itemStatus(a);
+      const sb = itemStatus(b);
+      const rank = (s: string) => (s === "未验货" ? 0 : s === "验货中" || s === "待证据" ? 1 : 2);
+      const ra = rank(sa);
+      const rb = rank(sb);
+      if (ra !== rb) return ra - rb;
+      return String(a?.sku || "").localeCompare(String(b?.sku || ""));
+    });
+
+    if (tab === "pending") return list.filter((it) => itemStatus(it) === "未验货");
+    if (tab === "doing")
+      return list.filter((it) => {
+        const s = itemStatus(it);
+        return s === "验货中" || s === "待证据";
+      });
+    return list.filter((it) => itemStatus(it) === "已完成");
+  }, [items, q, tab]);
+
   const ring = useMemo(() => {
     const r = 16;
     const c = 2 * Math.PI * r;
@@ -578,20 +662,24 @@ export default function WorkerScan() {
       <Header title={L("扫码验货", "Escanear")} hideBack />
 
       <div className="w-full max-w-[430px] mx-auto px-4 pt-4">
-        {/* ✅ 仅新增：扫码页独立语言开关（不改变原有结构/功能） */}
+        {/* ✅ 语言开关 */}
         <div className="flex items-center justify-end mb-3">
           <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
             <button
               type="button"
               onClick={() => setLang("zh")}
-              className={`h-8 px-3 rounded-full text-[12px] font-semibold active:scale-[0.98] ${lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
+              className={`h-8 px-3 rounded-full text-[12px] font-semibold active:scale-[0.98] ${
+                lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
+              }`}
             >
               ZH
             </button>
             <button
               type="button"
               onClick={() => setLang("es")}
-              className={`h-8 px-3 rounded-full text-[12px] font-semibold active:scale-[0.98] ${lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
+              className={`h-8 px-3 rounded-full text-[12px] font-semibold active:scale-[0.98] ${
+                lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
+              }`}
             >
               ES
             </button>
@@ -621,7 +709,15 @@ export default function WorkerScan() {
           >
             <video
               ref={videoRef}
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", display: "block", background: "#F4F6FA" }}
+              style={{
+                position: "absolute",
+                inset: 0,
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+                display: "block",
+                background: "#F4F6FA",
+              }}
               className={camOn ? "opacity-100" : "opacity-0"}
               muted
               playsInline
@@ -856,6 +952,47 @@ export default function WorkerScan() {
         className="absolute -left-[9999px] -top-[9999px] opacity-0 w-px h-px"
         onChange={(e) => commitEvidencePicked(e.target.files)}
       />
+
+      {/* ✅ 弹窗（更明显，不闪） */}
+      {modalOpen ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center px-4">
+          <div className="absolute inset-0 bg-black/40" onClick={closeModal} />
+          <div className="relative w-full max-w-[420px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            <div className="px-4 pt-4 pb-3">
+              <div className="text-[16px] font-extrabold text-slate-900">{modalTitle}</div>
+              {modalDesc ? <div className="mt-2 text-[13px] font-semibold text-slate-600 leading-6">{modalDesc}</div> : null}
+            </div>
+
+            <div className="px-4 pb-4 flex gap-3 justify-end">
+              {modalSecondaryText ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fn = modalSecondaryActionRef.current;
+                    closeModal();
+                    fn?.();
+                  }}
+                  className="h-10 px-4 rounded-2xl bg-white border border-slate-200 text-slate-700 font-extrabold active:scale-[0.98]"
+                >
+                  {modalSecondaryText}
+                </button>
+              ) : null}
+
+              <button
+                type="button"
+                onClick={() => {
+                  const fn = modalPrimaryActionRef.current;
+                  closeModal();
+                  fn?.();
+                }}
+                className="h-10 px-4 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.98]"
+              >
+                {modalPrimaryText}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-50">
