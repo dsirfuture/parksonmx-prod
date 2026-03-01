@@ -46,7 +46,6 @@ function fmtYMD(iso?: string) {
 function safeStr(v: any) {
   return String(v ?? "").trim();
 }
-
 async function copyText(text: string) {
   try {
     await navigator.clipboard.writeText(text);
@@ -127,27 +126,6 @@ function itemsSig(list: ReceiptItemRow[]) {
     .join("|");
 }
 
-/** ✅ diff 规则：默认 0 黑色；只有真实验货后（good+damaged>0）且 diff>0 才显示真实 diff（红色） */
-function calcDiff(expected: number, good: number, damaged: number) {
-  const done = good + damaged;
-  const rawDiff = Math.max(0, expected - done);
-  const show = done > 0 && rawDiff > 0;
-  return { done, rawDiff, show, value: show ? rawDiff : 0 };
-}
-
-/** ✅ WhatsApp：优先尝试打开；如果被拦截/失败再复制链接 */
-async function openWhatsAppOrCopy(textUrl: string, showToast: (msg: string) => void) {
-  const wa = `https://wa.me/?text=${encodeURIComponent(textUrl)}`;
-
-  // 尽量打开（移动端/桌面都可以）
-  const win = window.open(wa, "_blank", "noopener,noreferrer");
-  if (win) return;
-
-  // 打不开（被浏览器拦截 popup）=> 复制
-  const ok = await copyText(textUrl);
-  showToast(ok ? "已复制链接" : "复制失败");
-}
-
 export default function ReceiptDetail() {
   const params = useParams();
   // ✅ 兼容路由参数名 id / receiptId
@@ -171,7 +149,7 @@ export default function ReceiptDetail() {
   const lastReceiptSigRef = useRef<string>("");
   const lastItemsSigRef = useRef<string>("");
 
-  // ✅ SKU 证据页链接（HashRouter）
+  // ✅ 顾客证据页链接
   function evidenceShareLinkForSku(sku: string) {
     const base = `${window.location.origin}${window.location.pathname}#/share/evidence`;
     const qs = new URLSearchParams();
@@ -210,6 +188,7 @@ export default function ReceiptDetail() {
         setLoading(true);
       }
 
+      // receipts 列表结构兼容
       const list = await apiFetch<any>("/api/receipts?limit=50", { method: "GET" });
       const rows: ReceiptRow[] = parseReceiptListPayload(list);
       const found = rows.find((r) => String(r.id) === String(receiptId)) || null;
@@ -263,19 +242,17 @@ export default function ReceiptDetail() {
     const expectedTotal = toInt(receipt?.expected_total) || items.reduce((s, it) => s + toInt(it.expected_qty), 0);
     const goodTotal = toInt(receipt?.good_total) || items.reduce((s, it) => s + toInt(it.good_qty), 0);
     const damagedTotal = toInt(receipt?.damaged_total) || items.reduce((s, it) => s + toInt(it.damaged_qty), 0);
+    const doneTotal = goodTotal + damagedTotal;
 
-    const diff = calcDiff(expectedTotal, goodTotal, damagedTotal);
-    const progress = expectedTotal > 0 ? Math.round((diff.done / expectedTotal) * 100) : 0;
+    // ✅ diff 硬规则（收口到这里，别用后端 diff_total）
+    // 默认 0 且黑色；只有真实验货后(doneTotal>0)且diff>0才显示真实diff且红色
+    const rawDiff = Math.max(0, expectedTotal - doneTotal);
+    const showDiff = doneTotal > 0 && rawDiff > 0;
+    const diffTotal = showDiff ? rawDiff : 0;
 
-    return {
-      expectedTotal,
-      goodTotal,
-      damagedTotal,
-      doneTotal: diff.done,
-      diffTotal: diff.value,
-      diffShow: diff.show,
-      progress,
-    };
+    const progress = expectedTotal > 0 ? Math.round((doneTotal / expectedTotal) * 100) : 0;
+
+    return { expectedTotal, goodTotal, damagedTotal, diffTotal, doneTotal, progress };
   }, [receipt, items]);
 
   const [q, setQ] = useState("");
@@ -338,11 +315,10 @@ export default function ReceiptDetail() {
                 {agg.damagedTotal}
               </div>
             </div>
-
-            {/* ✅ diff：严格按硬规则显示 */}
             <div className="bg-[#F4F6FA] rounded-2xl p-3 border border-slate-200 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">相差</div>
-              <div className="mt-1 text-[16px] font-extrabold" style={{ color: agg.diffShow ? "#D32F2F" : "#0F172A" }}>
+              {/* ✅ 红色只在“真实验货后且diff>0”出现；否则 0 黑色 */}
+              <div className="mt-1 text-[16px] font-extrabold" style={{ color: agg.diffTotal > 0 ? "#D32F2F" : "#0F172A" }}>
                 {agg.diffTotal}
               </div>
             </div>
@@ -352,17 +328,20 @@ export default function ReceiptDetail() {
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="font-extrabold text-slate-900">分享给员工</div>
           <div className="mt-3 grid grid-cols-2 gap-4 text-center">
-            {/* ✅ WhatsApp：打开为主，失败再复制 */}
-            <button
-              type="button"
-              onClick={() => openWhatsAppOrCopy(workerShareUrl, showToast)}
+            <a
               className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
+              href={`https://wa.me/?text=${encodeURIComponent(workerShareUrl)}`}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                copyWorkerLink();
+              }}
             >
               <img src={WhatsAppIcon} alt="WhatsApp" className="w-10 h-10 mx-auto" />
               <div className="mt-2 text-[12px] text-slate-400 font-semibold">WhatsApp</div>
-            </button>
+            </a>
 
-            {/* WeChat：复制 */}
             <button
               type="button"
               onClick={copyWorkerLink}
@@ -406,8 +385,12 @@ export default function ReceiptDetail() {
               const expected = toInt(it.expected_qty);
               const good = toInt(it.good_qty);
               const damaged = toInt(it.damaged_qty);
+              const done = good + damaged;
 
-              const diff = calcDiff(expected, good, damaged);
+              // ✅ SKU diff 硬规则
+              const rawDiff = Math.max(0, expected - done);
+              const showDiff = done > 0 && rawDiff > 0;
+              const diff = showDiff ? rawDiff : 0;
 
               const ev = Array.isArray(it?.evidence_photo_urls)
                 ? it.evidence_photo_urls.length
@@ -467,15 +450,12 @@ export default function ReceiptDetail() {
                         {damaged}
                       </div>
                     </div>
-
-                    {/* ✅ item diff 同样严格按硬规则 */}
                     <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
                       <div className="text-[11px] text-slate-500 font-semibold">相差</div>
-                      <div className="mt-1 text-[16px] font-extrabold" style={{ color: diff.show ? "#D32F2F" : "#0F172A" }}>
-                        {diff.value}
+                      <div className="mt-1 text-[16px] font-extrabold" style={{ color: diff > 0 ? "#D32F2F" : "#0F172A" }}>
+                        {diff}
                       </div>
                     </div>
-
                     <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-2 text-center">
                       <div className="text-[11px] text-slate-500 font-semibold">证据</div>
                       <div className="mt-1 text-[16px] font-extrabold text-slate-900">{ev}</div>
@@ -511,17 +491,16 @@ export default function ReceiptDetail() {
                 <div>条形码: {safeStr(shareItem.barcode) || "-"}</div>
                 <div>中文名: {safeStr(shareItem.name_zh) || "-"}</div>
                 <div>西文名: {safeStr(shareItem.name_es) || "-"}</div>
-
                 <div className="pt-1 font-extrabold">
                   应验: {toInt(shareItem.expected_qty)}　良品: {toInt(shareItem.good_qty)}　破损: {toInt(shareItem.damaged_qty)}　相差:{" "}
                   {(() => {
                     const expected = toInt(shareItem.expected_qty);
-                    const good = toInt(shareItem.good_qty);
-                    const damaged = toInt(shareItem.damaged_qty);
-                    return calcDiff(expected, good, damaged).value;
+                    const done = toInt(shareItem.good_qty) + toInt(shareItem.damaged_qty);
+                    const raw = Math.max(0, expected - done);
+                    const show = done > 0 && raw > 0;
+                    return show ? raw : 0;
                   })()}
                 </div>
-
                 <div>
                   证据:{" "}
                   {Array.isArray(shareItem.evidence_photo_urls)
@@ -531,17 +510,16 @@ export default function ReceiptDetail() {
               </div>
 
               <div className="mt-4 grid grid-cols-2 gap-4 text-center">
-                {/* ✅ WhatsApp：打开为主，失败再复制 */}
-                <button
-                  type="button"
-                  onClick={() => openWhatsAppOrCopy(evidenceShareLinkForSku(shareItem.sku), showToast)}
+                <a
                   className="bg-white border border-slate-200 rounded-2xl py-4 shadow-sm active:scale-[0.99]"
+                  href={`https://wa.me/?text=${encodeURIComponent(evidenceShareLinkForSku(shareItem.sku))}`}
+                  target="_blank"
+                  rel="noreferrer"
                 >
                   <img src={WhatsAppIcon} alt="WhatsApp" className="w-10 h-10 mx-auto" />
                   <div className="mt-2 text-[12px] text-slate-400 font-semibold">WhatsApp</div>
-                </button>
+                </a>
 
-                {/* WeChat：复制 */}
                 <button
                   type="button"
                   onClick={async () => {
