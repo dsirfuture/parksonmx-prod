@@ -49,7 +49,7 @@ export default function ShareEvidencePage() {
 
   const [item, setItem] = useState<any>(null);
 
-  // localStorage 优先
+  // localStorage 作为兜底（但不再强行覆盖后端证据/时间）
   useEffect(() => {
     if (!receiptId || !sku) return;
     try {
@@ -60,7 +60,7 @@ export default function ShareEvidencePage() {
     } catch {}
   }, [receiptId, sku]);
 
-  // 尝试后端补齐（允许失败）
+  // ✅ 以“后端”为准补齐（证据/验货时间跨设备一致）
   useEffect(() => {
     let mounted = true;
     async function loadFromServer() {
@@ -69,28 +69,56 @@ export default function ShareEvidencePage() {
         const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items`, { method: "GET" });
         const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
         const found = Array.isArray(arr) ? arr.find((x: any) => String(x?.sku) === String(sku)) : null;
-        if (!found) return;
+        if (!found || !mounted) return;
 
-        if (!mounted) return;
         setItem((prev: any) => {
-          const base = prev && typeof prev === "object" ? { ...prev } : {};
+          const local = prev && typeof prev === "object" ? { ...prev } : {};
+
+          // ✅ 后端证据优先；如果后端没给，再用本地兜底
+          const serverUrls: string[] = Array.isArray(found?.evidence_photo_urls) ? found.evidence_photo_urls : [];
+          const localUrls: string[] = Array.isArray(local?.evidence_photo_urls) ? local.evidence_photo_urls : [];
+          const mergedUrls = serverUrls.length > 0 ? serverUrls : localUrls;
+
+          // ✅ 验货时间：优先 last_updated_at（Prisma @updatedAt），其次再兜底本地的 checkedAt/lastCheckedAt
+          const inspectTime =
+            found?.last_updated_at ??
+            found?.lastUpdatedAt ??
+            found?.last_updatedAt ??
+            found?.updated_at ??
+            local?.lastCheckedAt ??
+            local?.checkedAt ??
+            found?.checked_at ??
+            found?.checkedAt ??
+            found?.created_at;
+
           return {
+            ...local,
             ...found,
-            ...base,
-            sku: base?.sku ?? found?.sku,
-            barcode: base?.barcode ?? found?.barcode,
-            name_zh: base?.name_zh ?? found?.name_zh,
-            name_es: base?.name_es ?? found?.name_es,
-            qty: base?.qty ?? found?.expected_qty,
-            good_qty: base?.good_qty ?? found?.good_qty,
-            damaged_qty: base?.damaged_qty ?? found?.damaged_qty,
-            checkedAt: base?.checkedAt ?? found?.checked_at ?? found?.checkedAt ?? found?.created_at,
-            lastCheckedAt: base?.lastCheckedAt ?? found?.last_checked_at ?? found?.lastCheckedAt ?? found?.updated_at,
-            evidence_photo_urls: Array.isArray(base?.evidence_photo_urls) ? base.evidence_photo_urls : [],
+
+            // 统一字段
+            sku: local?.sku ?? found?.sku,
+            barcode: local?.barcode ?? found?.barcode,
+            name_zh: local?.name_zh ?? found?.name_zh,
+            name_es: local?.name_es ?? found?.name_es,
+
+            // qty：兼容 expected_qty / qty
+            qty: local?.qty ?? found?.qty ?? found?.expected_qty,
+
+            good_qty: typeof local?.good_qty === "number" ? local.good_qty : found?.good_qty,
+            damaged_qty: typeof local?.damaged_qty === "number" ? local.damaged_qty : found?.damaged_qty,
+
+            // ✅ 核心：证据以 server 为准
+            evidence_photo_urls: mergedUrls,
+
+            // ✅ 核心：时间以 server 为准
+            lastCheckedAt: inspectTime,
           };
         });
-      } catch {}
+      } catch {
+        // ignore
+      }
     }
+
     loadFromServer();
     return () => {
       mounted = false;
@@ -108,13 +136,18 @@ export default function ShareEvidencePage() {
   const good = toInt(item?.good_qty);
 
   const urls: string[] = Array.isArray(item?.evidence_photo_urls) ? item.evidence_photo_urls : [];
+
+  // ✅ 验货时间：优先 last_updated_at，其次 lastCheckedAt/checkedAt
   const inspectTime = useMemo(() => {
     const t =
+      item?.last_updated_at ??
+      item?.lastUpdatedAt ??
+      item?.last_updatedAt ??
+      item?.updated_at ??
       item?.lastCheckedAt ??
       item?.checkedAt ??
       item?.last_checked_at ??
       item?.checked_at ??
-      item?.updated_at ??
       item?.created_at;
     return fmtDateTime(t);
   }, [item]);
@@ -179,7 +212,7 @@ export default function ShareEvidencePage() {
             {lang === "ZH" ? "验货时间：" : "Hora:"} {inspectTime}
           </div>
 
-          {/* ✅ 原四格改为只保留一个：核查数量（=良品） */}
+          {/* ✅ 只保留一个：核查数量（=良品） */}
           <div className="mt-4">
             <div className="bg-[#F4F6FA] rounded-2xl border border-slate-200 p-3 text-center">
               <div className="text-[11px] text-slate-500 font-semibold">{lang === "ZH" ? "核查数量" : "Cantidad"}</div>
@@ -188,7 +221,7 @@ export default function ShareEvidencePage() {
           </div>
         </div>
 
-        {/* 证据区：无右侧数量；两列无圆角 */}
+        {/* 证据区：两列无圆角 */}
         <div>
           <div className="flex items-center justify-between">
             <div className="text-[14px] font-extrabold text-slate-900">{lang === "ZH" ? "证据" : "Evid"}</div>
