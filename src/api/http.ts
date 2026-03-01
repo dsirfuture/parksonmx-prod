@@ -18,25 +18,53 @@ function toAbsoluteUrl(input: string, baseUrl?: string) {
   return `${base}${path}`;
 }
 
-function readUserIdFromBackendConfig(): string {
+type BackendCfg = {
+  adminId?: string;
+  workerId?: string;
+  tenantId?: string;
+  companyId?: string;
+};
+
+function readBackendConfig(): BackendCfg {
   try {
     const raw = localStorage.getItem("parksonmx:backend:config");
-    if (!raw) return "";
+    if (!raw) return {};
     const cfg = JSON.parse(raw);
-    return String(cfg?.adminId || cfg?.workerId || "").trim();
+    return (cfg && typeof cfg === "object" ? cfg : {}) as BackendCfg;
   } catch {
-    return "";
+    return {};
   }
 }
 
 function readUserId() {
+  const cfg = readBackendConfig();
   return (
     localStorage.getItem("psmx_user_id") ||
     localStorage.getItem("parksonmx:user_id") ||
     localStorage.getItem("user_id") ||
     localStorage.getItem("ADMIN_ID") ||
     localStorage.getItem("WORKER_ID") ||
-    readUserIdFromBackendConfig() ||
+    (cfg.adminId ? String(cfg.adminId) : "") ||
+    (cfg.workerId ? String(cfg.workerId) : "") ||
+    String((import.meta as any)?.env?.VITE_ADMIN_ID || "").trim() ||
+    ""
+  );
+}
+
+function readTenantId() {
+  const cfg = readBackendConfig();
+  return (
+    (cfg.tenantId ? String(cfg.tenantId) : "") ||
+    String((import.meta as any)?.env?.VITE_TENANT_ID || "").trim() ||
+    ""
+  );
+}
+
+function readCompanyId() {
+  const cfg = readBackendConfig();
+  return (
+    (cfg.companyId ? String(cfg.companyId) : "") ||
+    String((import.meta as any)?.env?.VITE_COMPANY_ID || "").trim() ||
     ""
   );
 }
@@ -44,27 +72,39 @@ function readUserId() {
 function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
   const h = new Headers();
 
+  // 合并调用方 headers（调用方优先）
   if (extra) {
     const tmp = new Headers(extra);
     tmp.forEach((v, k) => h.set(k, v));
   }
 
+  // ✅ 强制补齐鉴权三件套（手机最容易缺）
   const userId = readUserId();
-  if (userId && !h.has("X-User-Id")) h.set("X-User-Id", userId);
+  const tenantId = readTenantId();
+  const companyId = readCompanyId();
 
+  if (userId && !h.has("X-User-Id")) h.set("X-User-Id", userId);
+  if (tenantId && !h.has("X-Tenant-Id")) h.set("X-Tenant-Id", tenantId);
+  if (companyId && !h.has("X-Company-Id")) h.set("X-Company-Id", companyId);
+
+  // Share token（可选）
   const shareToken =
     localStorage.getItem("psmx_share_token") ||
     localStorage.getItem("parksonmx:share_token") ||
     localStorage.getItem("SHARE_TOKEN") ||
     "";
-
   if (shareToken && !h.has("X-Share-Token")) h.set("X-Share-Token", shareToken);
 
   if (!h.has("Accept")) h.set("Accept", "application/json");
 
   if (debugAuth) {
     // eslint-disable-next-line no-console
-    console.log("[apiFetch] X-User-Id =", h.get("X-User-Id"));
+    console.log("[apiFetch headers]", {
+      "X-User-Id": h.get("X-User-Id"),
+      "X-Tenant-Id": h.get("X-Tenant-Id"),
+      "X-Company-Id": h.get("X-Company-Id"),
+      "X-Share-Token": h.get("X-Share-Token"),
+    });
   }
 
   return h;
