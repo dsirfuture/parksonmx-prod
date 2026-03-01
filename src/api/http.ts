@@ -36,7 +36,7 @@ function readBackendConfig(): BackendCfg {
   }
 }
 
-function readUserId() {
+function readUserId(): string {
   const cfg = readBackendConfig();
   return (
     localStorage.getItem("psmx_user_id") ||
@@ -48,25 +48,28 @@ function readUserId() {
     (cfg.workerId ? String(cfg.workerId) : "") ||
     String((import.meta as any)?.env?.VITE_ADMIN_ID || "").trim() ||
     ""
-  );
+  ).trim();
 }
 
-function readTenantId() {
+function readTenantId(): string {
   const cfg = readBackendConfig();
-  return (
-    (cfg.tenantId ? String(cfg.tenantId) : "") ||
-    String((import.meta as any)?.env?.VITE_TENANT_ID || "").trim() ||
-    ""
-  );
+  return ((cfg.tenantId ? String(cfg.tenantId) : "") || String((import.meta as any)?.env?.VITE_TENANT_ID || "")).trim();
 }
 
-function readCompanyId() {
+function readCompanyId(): string {
   const cfg = readBackendConfig();
   return (
-    (cfg.companyId ? String(cfg.companyId) : "") ||
-    String((import.meta as any)?.env?.VITE_COMPANY_ID || "").trim() ||
-    ""
-  );
+    (cfg.companyId ? String(cfg.companyId) : "") || String((import.meta as any)?.env?.VITE_COMPANY_ID || "")
+  ).trim();
+}
+
+function setIfMissingOrEmpty(h: Headers, key: string, value: string) {
+  if (!value) return;
+  const existed = h.get(key);
+  // ✅ 关键：不存在 或 值为空字符串/空白/ "null"/"undefined" 都要覆盖写入
+  if (!existed || !String(existed).trim() || existed === "null" || existed === "undefined") {
+    h.set(key, value);
+  }
 }
 
 function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
@@ -78,14 +81,10 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
     tmp.forEach((v, k) => h.set(k, v));
   }
 
-  // ✅ 强制补齐鉴权三件套（手机最容易缺）
-  const userId = readUserId();
-  const tenantId = readTenantId();
-  const companyId = readCompanyId();
-
-  if (userId && !h.has("X-User-Id")) h.set("X-User-Id", userId);
-  if (tenantId && !h.has("X-Tenant-Id")) h.set("X-Tenant-Id", tenantId);
-  if (companyId && !h.has("X-Company-Id")) h.set("X-Company-Id", companyId);
+  // ✅ 强制补齐三件套：即使上层传了空值，也要纠正
+  setIfMissingOrEmpty(h, "X-User-Id", readUserId());
+  setIfMissingOrEmpty(h, "X-Tenant-Id", readTenantId());
+  setIfMissingOrEmpty(h, "X-Company-Id", readCompanyId());
 
   // Share token（可选）
   const shareToken =
@@ -93,7 +92,7 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
     localStorage.getItem("parksonmx:share_token") ||
     localStorage.getItem("SHARE_TOKEN") ||
     "";
-  if (shareToken && !h.has("X-Share-Token")) h.set("X-Share-Token", shareToken);
+  setIfMissingOrEmpty(h, "X-Share-Token", String(shareToken || "").trim());
 
   if (!h.has("Accept")) h.set("Accept", "application/json");
 
@@ -141,6 +140,7 @@ export async function apiFetch<T = any>(url: string, options: ApiFetchOptions = 
   }
 
   if (res.status === 204) return null as any;
+
   const json = await readJsonSafe(res);
   return json && typeof json === "object" && "data" in json ? (json.data as T) : (json as T);
 }
