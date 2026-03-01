@@ -13,7 +13,6 @@ function toNum(v: any) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 }
-
 function pickBatchId(validateRes: any): string {
   const candidates = [
     validateRes?.batch_id,
@@ -51,23 +50,15 @@ export default function ImportPage() {
     }
   }
 
-  function toastFromError(e: any) {
-    const msg = String(e?.message || "");
-    const payloadMsg = String(e?.payload?.error?.message || e?.payload?.message || "");
-    const merged = `${msg} ${payloadMsg}`.toLowerCase();
-
-    if (merged.includes("batch_id is required") || merged.includes("batch_id")) {
-      return "导入失败：缺少 batch_id";
-    }
-    if (merged.includes("version_conflict") || e?.status === 409) {
-      return "导入失败：数据冲突，请重试";
-    }
-    // 默认保持你要求的文案
-    return "导入错误，请调整表格内标题";
-  }
-
   async function onPickFile(file: File) {
     setPickedName(file.name);
+
+    // ✅ 手机端常见：拿到 0 bytes（权限/分享打开方式导致）
+    if (!file || typeof file.size !== "number" || file.size <= 0) {
+      showToast("文件为空，请重新选择");
+      return;
+    }
+
     setBusy(true);
 
     const receiptNo = stripExt(file.name);
@@ -111,46 +102,50 @@ export default function ImportPage() {
       const validRows = toNum(validateRes?.valid_rows ?? validateRes?.data?.valid_rows);
       const batchId = pickBatchId(validateRes);
 
-      if (!canCommit || validRows <= 0) {
+      const exceptionsSummary =
+        validateRes?.exceptions_summary ??
+        validateRes?.data?.exceptions_summary ??
+        {};
+      const exceptionsCount =
+        toNum(validateRes?.exceptions_count ?? validateRes?.data?.exceptions_count);
+
+      // ✅ 诊断输出（不改 UI，只在 Console 打印）
+      // eslint-disable-next-line no-console
+      console.log("[import][validate]", {
+        fileName: file.name,
+        fileSize: file.size,
+        canCommit,
+        validRows,
+        batchId,
+        exceptionsCount,
+        exceptionsSummary,
+        raw: validateRes,
+      });
+
+      // 只要 validate 不通过，一律按你要求的文案提示 + 回滚
+      if (!canCommit || validRows <= 0 || !batchId) {
         await rollbackReceipt(receiptId);
+
+        // ✅ 仍然保持你的固定文案
         showToast("导入错误，请调整表格内标题");
-        return;
-      }
-      if (!batchId) {
-        // ✅ 这里不是标题问题，是后端没返回 batch_id（必须明确）
-        await rollbackReceipt(receiptId);
-        showToast("导入失败：缺少 batch_id");
+
+        // ✅ 但给你一个“立刻能定位”的提示：如果后端给了明确异常，打印出来
+        if (exceptionsCount > 0 || (exceptionsSummary && Object.keys(exceptionsSummary).length > 0)) {
+          // eslint-disable-next-line no-console
+          console.warn("[import][validate failed] exceptions:", exceptionsSummary);
+        }
         return;
       }
 
-      // 3) commit（优先 JSON body；若后端不认 body，再 fallback querystring）
-      let commitRes: any = null;
-      try {
-        commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": idemKey("commit"),
-          },
-          body: JSON.stringify({ batch_id: batchId }),
-        });
-      } catch (e: any) {
-        const m = String(e?.message || "").toLowerCase();
-        const pm = String(e?.payload?.error?.message || "").toLowerCase();
-        const merged = `${m} ${pm}`;
-        // 如果明确是 batch_id 问题，再尝试 querystring 方案
-        if (merged.includes("batch_id")) {
-          commitRes = await apiFetch<any>(
-            `/api/receipts/${encodeURIComponent(receiptId)}/import/commit?batch_id=${encodeURIComponent(batchId)}`,
-            {
-              method: "POST",
-              headers: { "Idempotency-Key": idemKey("commit2") },
-            }
-          );
-        } else {
-          throw e;
-        }
-      }
+      // 3) commit（带 batch_id）
+      const commitRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/import/commit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idemKey("commit"),
+        },
+        body: JSON.stringify({ batch_id: batchId }),
+      });
 
       const batchStatus =
         commitRes?.batch?.status ??
@@ -174,7 +169,10 @@ export default function ImportPage() {
       window.setTimeout(() => navigate("/admin/dashboard"), 600);
     } catch (e: any) {
       if (receiptId) await rollbackReceipt(receiptId);
-      showToast(toastFromError(e));
+      // ✅ 保持你要求的固定提示
+      showToast("导入错误，请调整表格内标题");
+      // eslint-disable-next-line no-console
+      console.error("[import][error]", e?.status, e?.message, e?.payload || e);
     } finally {
       setBusy(false);
     }
