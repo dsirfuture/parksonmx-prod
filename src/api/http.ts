@@ -170,3 +170,25 @@ export async function apiFetch<T = any>(url: string, options: ApiFetchOptions = 
   const json = await readJsonSafe(res);
   return json && typeof json === "object" && "data" in json ? (json.data as T) : (json as T);
 }
+export async function apiFetchBlob(url: string, options: ApiFetchOptions = {}): Promise<Blob> {
+  const abs = toAbsoluteUrl(url, options.baseUrl);
+  const headers = buildHeaders(options.headers, options.debugAuth);
+  const { baseUrl, debugAuth, ...rest } = options;
+
+  const res = await fetch(abs, { ...rest, headers });
+
+  if (!res.ok) {
+    const payload = await readJsonSafe(res);
+    const baseMsg =
+      (payload?.error?.message as string) ||
+      (payload?.message as string) ||
+      `HTTP_${res.status}`;
+    const err: any = new Error(baseMsg);
+    err.status = res.status;
+    err.payload = payload;
+    err.url = abs;
+    throw err;
+  }
+
+  return await res.blob();
+}
