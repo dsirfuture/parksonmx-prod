@@ -228,23 +228,24 @@ export default function AdminPcScan() {
     scanRef.current?.focus();
   }, []);
 
-  async function postScanIncrement(barcode: string, mode: "good" | "damaged") {
+  // ✅ 支持 increment（给“破损+1”用）
+  async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
-      body: JSON.stringify({ barcode, device_id: "pc-scanner", mode }),
+      body: JSON.stringify({ barcode, device_id: "pc-scanner", mode, increment }),
     });
   }
 
-  async function submitScan(raw: string, mode: "good" | "damaged") {
+  async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
     const v = norm(raw);
     if (!v) return;
 
     const now = Date.now();
     const last = lastCodeRef.current;
-    if (last.code === `${mode}:${v}` && now - last.ts < 300) return;
-    lastCodeRef.current = { code: `${mode}:${v}`, ts: now };
+    if (last.code === `${mode}:${increment || 0}:${v}` && now - last.ts < 300) return;
+    lastCodeRef.current = { code: `${mode}:${increment || 0}:${v}`, ts: now };
 
     const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
     const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === v) : -1;
@@ -272,7 +273,7 @@ export default function AdminPcScan() {
     setPinnedItemId(String(it.id));
 
     try {
-      const res = await postScanIncrement(String(it.barcode), mode);
+      const res = await postScanIncrement(String(it.barcode), mode, increment);
       const updated = res?.item ?? res?.data?.item ?? null;
 
       if (updated?.id) {
@@ -325,7 +326,7 @@ export default function AdminPcScan() {
     return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct };
   }, [items]);
 
-  // ✅ 搜索功能恢复：不再被抢焦点，所以输入可用；这里逻辑也保持正常
+  // ✅ 搜索功能恢复
   const filteredItems = useMemo(() => {
     const kw = norm(q);
     let list = items.filter((it) => {
@@ -474,7 +475,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 搜索/Tab + 列表（不允许左右滑动：table-fixed + 自动换行） */}
+        {/* 搜索/Tab + 列表 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <input
@@ -513,7 +514,6 @@ export default function AdminPcScan() {
           </div>
 
           <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
-            {/* ✅ 关键：table-fixed + break-words，禁止横向滚动 */}
             <table className="w-full table-fixed bg-white select-text">
               <thead className="bg-[#F4F6FA]">
                 <tr className="text-[12px] text-slate-600 font-extrabold">
@@ -560,6 +560,8 @@ export default function AdminPcScan() {
                       <td className="p-3 text-center" style={{ color: toInt(it.damaged_qty) > 0 ? "#D32F2F" : "#0F172A" }}>
                         {toInt(it.damaged_qty)}
                       </td>
+
+                      {/* ✅ 这里改成：破损按钮永远 +1（给后端传 increment: 1） */}
                       <td className="p-3 text-center">
                         <button
                           type="button"
@@ -567,7 +569,8 @@ export default function AdminPcScan() {
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            submitScan(String(it.barcode || it.sku || ""), "damaged");
+                            // 必须传 barcode（不要传 sku），并显式 increment=1
+                            submitScan(String(it.barcode || ""), "damaged", 1);
                           }}
                           className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
                             full
@@ -579,6 +582,7 @@ export default function AdminPcScan() {
                           {L("破损+1", "Daño+1")}
                         </button>
                       </td>
+
                       <td className="p-3 text-center" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
                         {diffValue}
                       </td>
