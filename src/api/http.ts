@@ -5,7 +5,7 @@ export type ApiFetchOptions = RequestInit & {
 
 const DEFAULT_API_BASE = "https://parksonmx.vercel.app";
 
-/** ✅ 兜底：保证手机端永远不会空头 */
+/** ✅ 兜底：保证手机端永远不会空头（保持你现有逻辑不变） */
 const DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001";
 const DEFAULT_COMPANY_ID = "11111111-1111-1111-1111-111111111111";
 /** 这里用你的 admin user id（你截图里就是这串） */
@@ -134,7 +134,13 @@ export async function apiFetch<T = any>(url: string, options: ApiFetchOptions = 
   const headers = buildHeaders(options.headers, options.debugAuth);
   const { baseUrl, debugAuth, ...rest } = options;
 
-  const res = await fetch(abs, { ...rest, headers });
+  // ✅ 关键新增：始终带上 Cookie（HttpOnly Session）
+  // 这样即使你将来把鉴权切到 Cookie，也不会再出现“导出/下载不带头”的问题
+  const res = await fetch(abs, {
+    ...rest,
+    headers,
+    credentials: "include",
+  });
 
   if (!res.ok) {
     const payload = await readJsonSafe(res);
