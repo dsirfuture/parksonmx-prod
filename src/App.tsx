@@ -16,7 +16,20 @@ import ShareEvidencePage from "./pages/ShareEvidencePage";
 
 import AdminPcScan from "./pages/AdminPcScan";
 
-/** -------------------- Receipts Types + Context -------------------- */
+/** ✅ 新增：根据路由决定是否用“手机壳” */
+function AppShell({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+  const isPc = location.pathname.startsWith("/admin/pc");
+
+  // PC：全屏；Mobile：保持 max-w 430 的手机壳
+  const cls = isPc
+    ? "min-h-screen flex flex-col bg-[#F4F6FA] w-full"
+    : "min-h-screen flex flex-col bg-[#F4F6FA] max-w-[430px] mx-auto shadow-2xl relative overflow-x-hidden";
+
+  return <div className={cls}>{children}</div>;
+}
+
+// -------------------- Receipts Types + Context --------------------
 export type ReceiptStatus = "待处理" | "验货中" | "已完成";
 
 export type Receipt = {
@@ -42,7 +55,7 @@ export const useReceipts = () => {
   return ctx;
 };
 
-/** -------------------- Auth Context -------------------- */
+// -------------------- Auth Context --------------------
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export const useAuth = () => {
@@ -121,7 +134,7 @@ const App: React.FC = () => {
       const next = { ...prev, ...data };
       return {
         ...next,
-        isReadOnly: next.role === UserRole.CUSTOMER || !!next.shareToken,
+        isReadOnly: next.role === UserRole.CUSTOMER || !!(next as any).shareToken,
       };
     });
   };
@@ -149,7 +162,7 @@ const App: React.FC = () => {
     <AuthContext.Provider value={authValue}>
       <ReceiptContext.Provider value={{ receipts, setReceipts }}>
         <HashRouter>
-          <div className="min-h-screen flex flex-col bg-[#F4F6FA] max-w-[430px] mx-auto shadow-2xl relative overflow-x-hidden">
+          <AppShell>
             {import.meta.env.VITE_PARKSONMX_BACKEND_MODE === "1" ? null : (
               <ReceiptsAutoSync receipts={receipts} setReceipts={setReceipts} />
             )}
@@ -159,21 +172,19 @@ const App: React.FC = () => {
               <Route path="/role" element={<RoleSelection />} />
 
               <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
-              <Route path="/admin/dashboard" element={<AdminDashboard receipts={receipts} />} />
+              <Route path="/admin/dashboard" element={<AdminDashboard />} />
               <Route path="/admin/import" element={<ImportPage />} />
               <Route path="/admin/export" element={<ExportPage />} />
-
-              {/* ✅ 新增：电脑端扫码枪页面（PC 专用入口） */}
-              <Route path="/admin/pc/scan" element={<AdminPcScan />} />
-
               <Route path="/admin/receipts/:receiptId" element={<ReceiptDetail />} />
+
+              {/* ✅ PC 专用入口 */}
+              <Route path="/admin/pc/scan" element={<AdminPcScan />} />
 
               <Route path="/worker/scan" element={<WorkerScan />} />
               <Route path="/worker/scan/*" element={<WorkerScan />} />
               <Route path="/worker/items/:id" element={<ItemDetail mode="worker" />} />
               <Route path="/worker/items/:id/done" element={<ItemDetail mode="worker" readOnlyOverride={true} />} />
 
-              {/* Share: 弹窗（内部） + 证据页（顾客） */}
               <Route path="/share" element={<SharePage />} />
               <Route path="/share/evidence" element={<ShareEvidencePage />} />
               <Route path="/share/token" element={<TokenValidate />} />
@@ -183,7 +194,7 @@ const App: React.FC = () => {
 
               <Route path="*" element={<Navigate to="/admin/dashboard" replace />} />
             </Routes>
-          </div>
+          </AppShell>
         </HashRouter>
       </ReceiptContext.Provider>
     </AuthContext.Provider>
