@@ -1,5 +1,6 @@
 // src/pages/WorkerScan.tsx
 // ✅ 证据不再存 dataURL 到本地：改为 presign -> PUT -> commit（进 DB，跨设备可见）
+// ✅ 新增：每次扫码命中的 SKU，会在「进行中」列表置顶（按 lastCheckedAt 倒序）
 // ✅ 语言：继续用你现有的 L(zh, es)，不会出现双语叠在一起
 // ✅ 其它逻辑尽量不动（扫码、统计、tab、UI风格保持一致）
 
@@ -42,6 +43,15 @@ function toInt(v: any) {
 function looksLikeNumericBarcode(vRaw: string) {
   const v = vRaw.trim();
   return /^\d{8,}$/.test(v);
+}
+
+// ✅ 用于“最近扫码置顶”：兼容 number / string / Date
+function toTs(v: any): number {
+  if (!v) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (v instanceof Date) return Number.isFinite(v.getTime()) ? v.getTime() : 0;
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? t : 0;
 }
 
 function itemStatus(it: any): "未验货" | "验货中" | "待证据" | "已完成" {
@@ -121,7 +131,6 @@ export default function WorkerScan() {
   const meta = useMemo(() => (receiptId ? getReceiptMeta(receiptId) : null), [receiptId]);
   const deviceId = useMemo(() => ensureDeviceId(), []);
 
-  // ✅ 语言（保持你现在的方式：整页一种语言）
   type Lang = "zh" | "es";
   const [lang, setLang] = useState<Lang>(() => {
     try {
@@ -143,7 +152,6 @@ export default function WorkerScan() {
     return (getReceiptItems(receiptId) as any[]) || [];
   });
 
-  // toast
   const [toast, setToast] = useState<string>("");
   function showToast(msg: string) {
     setToast(msg);
@@ -185,7 +193,6 @@ export default function WorkerScan() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
 
-  // 仍然存 items（但现在 evidence_photo_urls 都是“后端URL”，不会再是 dataURL）
   useEffect(() => {
     if (!receiptId) return;
     try {
@@ -200,7 +207,6 @@ export default function WorkerScan() {
   const scanInputRef = useRef<HTMLInputElement | null>(null);
   const [damagedCount, setDamagedCount] = useState<number>(0);
 
-  // 手输条码自动识别
   const autoInputTimerRef = useRef<number | null>(null);
   function scheduleAutoSubmit(val: string) {
     if (autoInputTimerRef.current) window.clearTimeout(autoInputTimerRef.current);
@@ -214,7 +220,6 @@ export default function WorkerScan() {
     }, 450);
   }
 
-  // camera
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
   const [camOn, setCamOn] = useState(false);
@@ -300,7 +305,6 @@ export default function WorkerScan() {
     });
   }
 
-  // ✅ 写入验货时间（供证据页显示）
   function stampCheckedAt(idx: number) {
     const now = Date.now();
     setItems((prev) => {
@@ -327,7 +331,6 @@ export default function WorkerScan() {
       cur.status = updated.status ?? cur.status;
       cur.version = updated.version ?? cur.version;
 
-      // ✅ 关键：后端会回填 evidence_photo_urls / evidence_count
       if (Array.isArray(updated.evidence_photo_urls)) cur.evidence_photo_urls = updated.evidence_photo_urls;
       if (updated.evidence_count != null) cur.evidence_count = toInt(updated.evidence_count);
       if (updated.evidence_photo_count != null) cur.evidence_photo_count = toInt(updated.evidence_photo_count);
@@ -392,6 +395,9 @@ export default function WorkerScan() {
       return;
     }
 
+    // ✅ 一扫码就切到「进行中」，并在列表置顶显示（靠 lastCheckedAt 倒序）
+    if (tab !== "doing") setTab("doing");
+
     const it = items[idx];
     const expected = toInt(it?.qty);
     const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
@@ -401,7 +407,6 @@ export default function WorkerScan() {
       ? it.evidence_photo_urls.length
       : toInt(it?.evidence_photo_count ?? it?.evidence_count);
 
-    // ✅ 扫到已完成 SKU：提示“验货完毕”；若缺证据提示“请添加证据”
     if (expected > 0 && done >= expected) {
       showToast(photoCount > 0 ? L("验货完毕", "Completado") : L("请添加证据", "Falta foto"));
       setScanInput("");
@@ -412,6 +417,7 @@ export default function WorkerScan() {
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
     const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
 
+    // ✅ 关键：先写 lastCheckedAt，让“进行中列表”立即置顶（不用等后端轮询）
     stampCheckedAt(idx);
 
     try {
@@ -442,13 +448,20 @@ export default function WorkerScan() {
       return hay.includes(kw);
     });
 
+    // ✅ 排序：状态优先，其次“最近扫码(lastCheckedAt)置顶”，最后 SKU
     list = list.sort((a, b) => {
       const sa = itemStatus(a);
       const sb = itemStatus(b);
       const rank = (s: string) => (s === "未验货" ? 0 : s === "验货中" || s === "待证据" ? 1 : 2);
+
       const ra = rank(sa);
       const rb = rank(sb);
       if (ra !== rb) return ra - rb;
+
+      const ta = toTs(a?.lastCheckedAt) || toTs(a?.checkedAt);
+      const tb = toTs(b?.lastCheckedAt) || toTs(b?.checkedAt);
+      if (ta !== tb) return tb - ta;
+
       return String(a?.sku || "").localeCompare(String(b?.sku || ""));
     });
 
@@ -469,10 +482,6 @@ export default function WorkerScan() {
     requestAnimationFrame(() => photoInputRef.current?.click());
   }
 
-  /**
-   * ✅ 核心：证据进后端（跨设备一致）
-   * 流程：presign -> PUT(upload_url) -> commit(file_url)
-   */
   async function commitEvidencePicked(files: FileList | null) {
     if (!files || files.length === 0) return;
     if (eviTargetIndex === null) return;
@@ -488,7 +497,6 @@ export default function WorkerScan() {
 
     try {
       for (const file of fileArr) {
-        // 1) presign
         const presignRes = await apiFetch<any>(
           `/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}/evidence/presign`,
           {
@@ -505,27 +513,18 @@ export default function WorkerScan() {
 
         const p = presignRes?.data ?? presignRes;
 
-        const uploadUrl =
-          p?.upload_url || p?.uploadUrl || p?.put_url || p?.putUrl || p?.url;
+        const uploadUrl = p?.upload_url || p?.uploadUrl || p?.put_url || p?.putUrl || p?.url;
+        const fileUrl = p?.file_url || p?.fileUrl || p?.public_url || p?.publicUrl || p?.key;
 
-        const fileUrl =
-          p?.file_url || p?.fileUrl || p?.public_url || p?.publicUrl || p?.key;
+        if (!uploadUrl || !fileUrl) throw new Error("presign_invalid");
 
-        if (!uploadUrl || !fileUrl) {
-          throw new Error("presign_invalid");
-        }
-
-        // 2) PUT upload
         const putRes = await fetch(uploadUrl, {
           method: "PUT",
-          headers: {
-            "Content-Type": file.type || "application/octet-stream",
-          },
+          headers: { "Content-Type": file.type || "application/octet-stream" },
           body: file,
         });
         if (!putRes.ok) throw new Error("upload_failed");
 
-        // 3) commit (写入 Evidence + 回填 ReceiptItem.evidence_photo_urls / evidence_count)
         const idem = makeIdempotencyKey(deviceId);
         const commitRes = await apiFetch<any>(
           `/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}/evidence/commit`,
@@ -545,12 +544,9 @@ export default function WorkerScan() {
         if (updatedItem?.id) applyServerItemToLocal(updatedItem);
       }
 
-      // 4) 拉一次最新 items（保证跨设备一致）
       await loadItemsFromServer(true);
-
       showToast(L("证据已上传", "Foto subida"));
 
-      // 上传证据后，自动切 Tab（done / doing）
       const latest = items.find((x: any) => String(x?.id) === itemId) || target;
       const expected = toInt(latest?.qty);
       const done = toInt(latest?.good_qty) + toInt(latest?.damaged_qty);
@@ -563,7 +559,6 @@ export default function WorkerScan() {
     } catch {
       showToast(L("证据提交失败", "Error foto"));
     } finally {
-      // 清空 file input，避免同一张图第二次选不触发 change
       try {
         if (photoInputRef.current) photoInputRef.current.value = "";
       } catch {}
@@ -590,7 +585,6 @@ export default function WorkerScan() {
       <Header title={L("扫码验货", "Escanear")} hideBack />
 
       <div className="w-full max-w-[430px] mx-auto px-4 pt-4">
-        {/* 语言开关（保持你现在的UI） */}
         <div className="flex items-center justify-end mb-3">
           <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
             <button
@@ -637,15 +631,7 @@ export default function WorkerScan() {
           >
             <video
               ref={videoRef}
-              style={{
-                position: "absolute",
-                inset: 0,
-                width: "100%",
-                height: "100%",
-                objectFit: "cover",
-                display: "block",
-                background: "#F4F6FA",
-              }}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", display: "block", background: "#F4F6FA" }}
               className={camOn ? "opacity-100" : "opacity-0"}
               muted
               playsInline
@@ -726,7 +712,6 @@ export default function WorkerScan() {
         </div>
       </div>
 
-      {/* Bottom Sheet */}
       <div className="mt-3 px-4 flex-1 flex">
         <section className="w-full max-w-[430px] mx-auto bg-white rounded-t-[32px] border border-slate-200 shadow-[0_-8px_30px_rgba(0,0,0,0.05)] pt-2 pb-7 flex-1 overflow-y-auto">
           <div className="w-12 h-1.5 bg-slate-100 rounded-full mx-auto my-4" />
@@ -871,7 +856,6 @@ export default function WorkerScan() {
         </section>
       </div>
 
-      {/* 证据选择（手机拍照/相册） */}
       <input
         ref={photoInputRef}
         key={String(eviTargetIndex ?? "none")}
