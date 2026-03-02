@@ -97,16 +97,12 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
   setIfMissingOrEmpty(h, "X-Tenant-Id", readTenantId());
   setIfMissingOrEmpty(h, "X-Company-Id", readCompanyId());
 
-  const shareToken =
-    localStorage.getItem("psmx_share_token") ||
-    localStorage.getItem("parksonmx:share_token") ||
-    localStorage.getItem("SHARE_TOKEN") ||
-    "";
-  const shareToken =
-    localStorage.getItem("psmx_share_token") ||
-    localStorage.getItem("parksonmx:share_token") ||
-    localStorage.getItem("SHARE_TOKEN") ||
-    "";
+// ✅ Share token（只声明一次）
+const shareToken =
+  localStorage.getItem("psmx_share_token") ||
+  localStorage.getItem("parksonmx:share_token") ||
+  localStorage.getItem("SHARE_TOKEN") ||
+  "";
 
   // ✅ 关键：有 X-User-Id 时，不自动注入 Share-Token（避免 admin-only 被 token 身份抢走）
   const uid = String(h.get("X-User-Id") || "").trim();
