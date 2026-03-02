@@ -102,7 +102,17 @@ function buildHeaders(extra?: HeadersInit, debugAuth?: boolean) {
     localStorage.getItem("parksonmx:share_token") ||
     localStorage.getItem("SHARE_TOKEN") ||
     "";
-  setIfMissingOrEmpty(h, "X-Share-Token", String(shareToken || "").trim());
+  const shareToken =
+    localStorage.getItem("psmx_share_token") ||
+    localStorage.getItem("parksonmx:share_token") ||
+    localStorage.getItem("SHARE_TOKEN") ||
+    "";
+
+  // ✅ 关键：有 X-User-Id 时，不自动注入 Share-Token（避免 admin-only 被 token 身份抢走）
+  const uid = String(h.get("X-User-Id") || "").trim();
+  if (!uid) {
+    setIfMissingOrEmpty(h, "X-Share-Token", String(shareToken || "").trim());
+  }
 
   if (!h.has("Accept")) h.set("Accept", "application/json");
 
