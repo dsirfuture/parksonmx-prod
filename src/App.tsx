@@ -1,3 +1,4 @@
+// src/App.tsx
 import React, { useEffect, useMemo, useState, createContext, useContext } from "react";
 import { HashRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 
@@ -16,20 +17,7 @@ import ShareEvidencePage from "./pages/ShareEvidencePage";
 
 import AdminPcScan from "./pages/AdminPcScan";
 
-/** ✅ 新增：根据路由决定是否用“手机壳” */
-function AppShell({ children }: { children: React.ReactNode }) {
-  const location = useLocation();
-  const isPc = location.pathname.startsWith("/admin/pc");
-
-  // PC：全屏；Mobile：保持 max-w 430 的手机壳
-  const cls = isPc
-    ? "min-h-screen flex flex-col bg-[#F4F6FA] w-full"
-    : "min-h-screen flex flex-col bg-[#F4F6FA] max-w-[430px] mx-auto shadow-2xl relative overflow-x-hidden";
-
-  return <div className={cls}>{children}</div>;
-}
-
-// -------------------- Receipts Types + Context --------------------
+/** -------------------- Receipts Types + Context -------------------- */
 export type ReceiptStatus = "待处理" | "验货中" | "已完成";
 
 export type Receipt = {
@@ -55,7 +43,7 @@ export const useReceipts = () => {
   return ctx;
 };
 
-// -------------------- Auth Context --------------------
+/** -------------------- Auth Context -------------------- */
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export const useAuth = () => {
@@ -120,6 +108,24 @@ const ReceiptsAutoSync: React.FC<{
   return null;
 };
 
+// ✅ 关键：根据路由决定用“手机壳”还是“PC 大屏容器”
+function AppShell({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+  const isPc = location.pathname.startsWith("/admin/pc");
+
+  if (isPc) {
+    // PC：全宽，不要手机壳样式
+    return <div className="min-h-screen bg-[#F4F6FA]">{children}</div>;
+  }
+
+  // Mobile：保留你原来的手机壳
+  return (
+    <div className="min-h-screen flex flex-col bg-[#F4F6FA] max-w-[430px] mx-auto shadow-2xl relative overflow-x-hidden">
+      {children}
+    </div>
+  );
+}
+
 const App: React.FC = () => {
   const [authData, setAuthData] = useState<Omit<AuthContextType, "setAuth">>({
     role: UserRole.WORKER,
@@ -134,7 +140,7 @@ const App: React.FC = () => {
       const next = { ...prev, ...data };
       return {
         ...next,
-        isReadOnly: next.role === UserRole.CUSTOMER || !!(next as any).shareToken,
+        isReadOnly: next.role === UserRole.CUSTOMER || !!next.shareToken,
       };
     });
   };
@@ -177,7 +183,7 @@ const App: React.FC = () => {
               <Route path="/admin/export" element={<ExportPage />} />
               <Route path="/admin/receipts/:receiptId" element={<ReceiptDetail />} />
 
-              {/* ✅ PC 专用入口 */}
+              {/* ✅ PC 入口 */}
               <Route path="/admin/pc/scan" element={<AdminPcScan />} />
 
               <Route path="/worker/scan" element={<WorkerScan />} />
