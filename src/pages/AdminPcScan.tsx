@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Header } from "../components/Shared";
-import { apiFetch } from "../api/http";
+import { apiFetch, apiFetchBlob } from "../api/http"; // ✅ 改：引入 apiFetchBlob
 
 function getQuery() {
   const h = window.location.hash || "";
@@ -68,68 +68,13 @@ function SummarySquare({ label, value, danger }: { label: string; value: number;
   );
 }
 
-/** 导出（保持你现有能用的逻辑，不动后端） */
-function readLs(key: string) {
-  try {
-    return String(localStorage.getItem(key) || "").trim();
-  } catch {
-    return "";
-  }
-}
-function readBackendCfg(): any {
-  try {
-    const raw = localStorage.getItem("parksonmx:backend:config");
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-function getApiBase() {
-  const v = (import.meta as any)?.env?.VITE_API_BASE;
-  const base = typeof v === "string" && v.trim() ? v.trim().replace(/\/+$/, "") : "https://parksonmx.vercel.app";
-  return base;
-}
-function absApi(path: string) {
-  if (/^https?:\/\//i.test(path)) return path;
-  const base = getApiBase();
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${base}${p}`;
-}
-function buildAdminHeadersForDownload() {
-  const cfg = readBackendCfg();
-  const h = new Headers();
-  h.set("Accept", "*/*");
-
-  const userId =
-    readLs("psmx_user_id") ||
-    readLs("ADMIN_ID") ||
-    (cfg?.adminId ? String(cfg.adminId).trim() : "") ||
-    String((import.meta as any)?.env?.VITE_ADMIN_ID || "").trim();
-
-  const tenantId =
-    (cfg?.tenantId ? String(cfg.tenantId).trim() : "") ||
-    String((import.meta as any)?.env?.VITE_TENANT_ID || "").trim() ||
-    "00000000-0000-0000-0000-000000000001";
-
-  const companyId =
-    (cfg?.companyId ? String(cfg.companyId).trim() : "") ||
-    String((import.meta as any)?.env?.VITE_COMPANY_ID || "").trim() ||
-    "11111111-1111-1111-1111-111111111111";
-
-  if (userId) h.set("X-User-Id", userId);
-  if (tenantId) h.set("X-Tenant-Id", tenantId);
-  if (companyId) h.set("X-Company-Id", companyId);
-
-  return h;
-}
+// ✅ 改：导出统一用 apiFetchBlob（自动走你项目统一鉴权 header，跨电脑也能用）
 async function downloadExportXlsx(receiptId: string, receiptNo: string) {
-  const url = absApi(`/api/receipts/${encodeURIComponent(receiptId)}/export.xlsx`);
-  const res = await fetch(url, { method: "GET", headers: buildAdminHeadersForDownload() });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}${t ? `: ${t}` : ""}`);
-  }
-  const blob = await res.blob();
+  const blob = await apiFetchBlob(`/api/receipts/${encodeURIComponent(receiptId)}/export.xlsx`, {
+    method: "GET",
+    headers: { Accept: "*/*" },
+  });
+
   const href = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = href;
@@ -223,12 +168,10 @@ export default function AdminPcScan() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
 
-  // ✅ 只在页面首次进入时聚焦扫码框（不再“点击任何地方都抢焦点”）
   useEffect(() => {
     scanRef.current?.focus();
   }, []);
 
-  // ✅ 支持 increment（给“破损+1”用）
   async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
@@ -326,7 +269,6 @@ export default function AdminPcScan() {
     return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct };
   }, [items]);
 
-  // ✅ 搜索功能恢复
   const filteredItems = useMemo(() => {
     const kw = norm(q);
     let list = items.filter((it) => {
@@ -369,7 +311,6 @@ export default function AdminPcScan() {
       <Header title={L("PC 扫码枪验货", "PC Escáner")} onBack={() => nav("/admin/dashboard")} />
 
       <main className="flex-1 w-full max-w-[1400px] mx-auto px-6 pt-4 pb-6 space-y-3 select-text">
-        {/* 四个同一行：验货单号 / 总进度 / 导出表格 / 语言切换 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -424,7 +365,6 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 汇总 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -436,7 +376,6 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 扫码输入（自动识别恢复） */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="text-[12px] text-slate-500 font-bold">{L("扫码枪输入", "Entrada escáner")}</div>
           <div className="mt-2 flex gap-2">
@@ -475,7 +414,6 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 搜索/Tab + 列表 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <input
@@ -561,7 +499,6 @@ export default function AdminPcScan() {
                         {toInt(it.damaged_qty)}
                       </td>
 
-                      {/* ✅ 这里改成：破损按钮永远 +1（给后端传 increment: 1） */}
                       <td className="p-3 text-center">
                         <button
                           type="button"
@@ -569,13 +506,10 @@ export default function AdminPcScan() {
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            // 必须传 barcode（不要传 sku），并显式 increment=1
                             submitScan(String(it.barcode || ""), "damaged", 1);
                           }}
                           className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
-                            full
-                              ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed"
-                              : "bg-white border-[#D32F2F] text-[#D32F2F]"
+                            full ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed" : "bg-white border-[#D32F2F] text-[#D32F2F]"
                           }`}
                           title={full ? L("数量已满", "Lleno") : L("破损+1", "Daño +1")}
                         >
