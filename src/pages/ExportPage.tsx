@@ -2,8 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Search, FileDown } from "lucide-react";
 import { Header } from "../components/Shared";
-import { apiFetch } from "../api/http";
-import { ensureBackendConfigOnce, getBackendConfig } from "../api/backendConfig";
+import { apiFetch, apiFetchBlob } from "../api/http";
+import { ensureBackendConfigOnce } from "../api/backendConfig";
 
 type ReceiptRow = {
   id: string;
@@ -26,21 +26,6 @@ function fmtYMD(iso?: string) {
   return String(iso).split("T")[0] || "-";
 }
 
-function getApiBase() {
-  const v = (import.meta as any)?.env?.VITE_API_BASE;
-  const base =
-    typeof v === "string" && v.trim()
-      ? v.trim().replace(/\/+$/, "")
-      : "https://parksonmx.vercel.app";
-  return base;
-}
-function absUrl(path: string) {
-  if (/^https?:\/\//i.test(path)) return path;
-  const base = getApiBase();
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${base}${p}`;
-}
-
 function calcExpected(r: ReceiptRow) {
   return toInt(r.expected_total);
 }
@@ -53,24 +38,7 @@ function isCompleted(r: ReceiptRow) {
   return expected > 0 && done >= expected;
 }
 
-function buildAdminHeaders(): Headers {
-  const cfg = getBackendConfig() || ensureBackendConfigOnce();
-  const h = new Headers();
-  h.set("Accept", "*/*");
-  h.set("X-User-Id", cfg.adminId);
-  h.set("X-Tenant-Id", cfg.tenantId);
-  h.set("X-Company-Id", cfg.companyId);
-  return h;
-}
-
-async function downloadXlsxWithAuth(url: string, filename: string) {
-  const res = await fetch(absUrl(url), { method: "GET", headers: buildAdminHeaders() });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    const msg = (t || "").replace(/\s+/g, " ").slice(0, 120);
-    throw new Error(`HTTP ${res.status}${msg ? `: ${msg}` : ""}`);
-  }
-  const blob = await res.blob();
+function triggerDownload(blob: Blob, filename: string) {
   const a = document.createElement("a");
   const href = URL.createObjectURL(blob);
   a.href = href;
@@ -107,6 +75,7 @@ export default function ExportPage() {
   }
 
   useEffect(() => {
+    // 保证第一次打开就写入配置（如果 env 齐全）
     ensureBackendConfigOnce();
     load(false);
     const t = window.setInterval(() => load(true), 3000);
@@ -127,10 +96,16 @@ export default function ExportPage() {
 
   async function handleExport(r: ReceiptRow) {
     try {
-      // ✅ 后端真实路由：/api/receipts/[id]/export.xlsx:contentReference[oaicite:2]{index=2}
-      const url = `/api/receipts/${encodeURIComponent(r.id)}/export.xlsx`;
+      const path = `/api/receipts/${encodeURIComponent(r.id)}/export.xlsx`;
       const filename = `${r.receipt_no || r.id}.xlsx`;
-      await downloadXlsxWithAuth(url, filename);
+
+      // ✅ 关键：用 apiFetchBlob（自动带你 http.ts 里的鉴权头）
+      const blob = await apiFetchBlob(path, {
+        method: "GET",
+        headers: { Accept: "*/*" },
+      });
+
+      triggerDownload(blob, filename);
       showToast("已开始下载");
     } catch (e: any) {
       showToast(`导出失败(${String(e?.message || "未知错误")})`);
@@ -209,13 +184,19 @@ export default function ExportPage() {
                   </div>
                   <div className="text-center bg-[#F4F6FA] border border-slate-200 rounded-2xl py-3">
                     <div className="text-[10px] text-slate-500 font-bold">破损</div>
-                    <div className="mt-2 text-[16px] font-extrabold" style={{ color: damaged > 0 ? "#D32F2F" : "#0F172A" }}>
+                    <div
+                      className="mt-2 text-[16px] font-extrabold"
+                      style={{ color: damaged > 0 ? "#D32F2F" : "#0F172A" }}
+                    >
                       {damaged}
                     </div>
                   </div>
                   <div className="text-center bg-[#F4F6FA] border border-slate-200 rounded-2xl py-3">
                     <div className="text-[10px] text-slate-500 font-bold">相差</div>
-                    <div className="mt-2 text-[16px] font-extrabold" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
+                    <div
+                      className="mt-2 text-[16px] font-extrabold"
+                      style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}
+                    >
                       {diffValue}
                     </div>
                   </div>
