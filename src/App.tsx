@@ -14,6 +14,11 @@ import TokenValidate from "./pages/TokenValidate";
 import SharePage from "./pages/SharePage";
 import ShareEvidencePage from "./pages/ShareEvidencePage";
 
+import AdminPcScan from "./pages/AdminPcScan";
+
+// 在 <Routes> 内新增：
+<Route path="/admin/pc/scan" element={<AdminPcScan />} />
+
 /** -------------------- Receipts Types + Context -------------------- */
 export type ReceiptStatus = "待处理" | "验货中" | "已完成";
 
