@@ -16,9 +16,6 @@ import ShareEvidencePage from "./pages/ShareEvidencePage";
 
 import AdminPcScan from "./pages/AdminPcScan";
 
-// 在 <Routes> 内新增：
-<Route path="/admin/pc/scan" element={<AdminPcScan />} />
-
 /** -------------------- Receipts Types + Context -------------------- */
 export type ReceiptStatus = "待处理" | "验货中" | "已完成";
 
@@ -165,6 +162,10 @@ const App: React.FC = () => {
               <Route path="/admin/dashboard" element={<AdminDashboard receipts={receipts} />} />
               <Route path="/admin/import" element={<ImportPage />} />
               <Route path="/admin/export" element={<ExportPage />} />
+
+              {/* ✅ 新增：电脑端扫码枪页面（PC 专用入口） */}
+              <Route path="/admin/pc/scan" element={<AdminPcScan />} />
+
               <Route path="/admin/receipts/:receiptId" element={<ReceiptDetail />} />
 
               <Route path="/worker/scan" element={<WorkerScan />} />
