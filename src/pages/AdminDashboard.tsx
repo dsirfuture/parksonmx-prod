@@ -107,6 +107,15 @@ export default function AdminDashboard() {
     return rows.filter((r) => `${r.receipt_no || ""} ${r.status || ""} ${r.created_at || ""}`.toLowerCase().includes(k));
   }, [rows, q]);
 
+  function goPcScan(e: React.MouseEvent, r: ReceiptRow) {
+    e.preventDefault();
+    e.stopPropagation();
+    const qs = new URLSearchParams();
+    qs.set("receiptId", String(r.id));
+    qs.set("receiptNo", String(r.receipt_no || r.id));
+    nav(`/admin/pc/scan?${qs.toString()}`);
+  }
+
   return (
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col">
       <Header title="管理看板" onBack={() => nav("/role")} />
@@ -146,7 +155,6 @@ export default function AdminDashboard() {
           </div>
         </div>
 
-        {/* ✅ 标题 + 提示：同一行（字体/颜色保持原值） */}
         <div className="flex items-baseline justify-between px-1">
           <div className="flex items-baseline gap-2">
             <div className="text-[14px] font-extrabold text-slate-900">验货单列表</div>
@@ -200,6 +208,17 @@ export default function AdminDashboard() {
 
                   <div className="flex flex-col items-end gap-2">
                     <span className={`px-3 py-1 rounded-full text-[11px] font-extrabold ${statusPillClass(s)}`}>{s}</span>
+
+                    {/* ✅ 新增：PC 扫码枪入口（不触发卡片点击） */}
+                    <button
+                      type="button"
+                      onClick={(e) => goPcScan(e, r)}
+                      className="h-9 px-3 rounded-2xl bg-white border border-slate-200 text-[12px] font-extrabold text-[#2F3C7E] active:scale-[0.99]"
+                      aria-label="pc-scan"
+                      title="电脑端扫码枪"
+                    >
+                      PC 扫码枪
+                    </button>
 
                     {/* 删除：只保留ICON */}
                     <button
