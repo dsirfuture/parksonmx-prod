@@ -17,14 +17,16 @@ function toInt(v: any) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
 }
-
-// ✅ 用于“最近扫码置顶”：兼容 number / string / Date
 function toTs(v: any): number {
   if (!v) return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
   if (v instanceof Date) return Number.isFinite(v.getTime()) ? v.getTime() : 0;
   const t = Date.parse(String(v));
   return Number.isFinite(t) ? t : 0;
+}
+function looksLikeNumericBarcode(vRaw: string) {
+  const v = vRaw.trim();
+  return /^\d{8,}$/.test(v);
 }
 
 type TabKey = "pending" | "doing" | "done";
@@ -50,13 +52,14 @@ function badgeCls(s: string) {
   return "bg-[#FBEAEB] text-[#2F3C7E] border-slate-200";
 }
 
+const PIN_MS = 8000; // ✅ 置顶保持时长：8秒（你想更久就改这里）
+
 export default function AdminPcScan() {
   const nav = useNavigate();
   const sp = useMemo(() => getQuery(), []);
   const receiptId = sp.get("receiptId") || "";
   const receiptNo = sp.get("receiptNo") || receiptId || "—";
 
-  // 语言（整页单语言）
   type Lang = "zh" | "es";
   const [lang, setLang] = useState<Lang>("zh");
   const L = (zh: string, es: string) => (lang === "zh" ? zh : es);
@@ -69,8 +72,23 @@ export default function AdminPcScan() {
   const scanRef = useRef<HTMLInputElement | null>(null);
   const [scanInput, setScanInput] = useState("");
 
-  // 同码去重（扫码枪会很快）
+  // 同码去重
   const lastCodeRef = useRef<{ code: string; ts: number }>({ code: "", ts: 0 });
+
+  // ✅ 自动识别条码：输入停顿后自动提交
+  const autoTimerRef = useRef<number | null>(null);
+  function scheduleAutoSubmit(val: string) {
+    if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
+    const raw = String(val || "").trim();
+    if (!raw) return;
+    // 扫码枪通常很快 + 自动回车，但这里保留“无回车也能自动提交”
+    autoTimerRef.current = window.setTimeout(() => {
+      if (looksLikeNumericBarcode(raw)) {
+        setScanInput("");
+        submitScan(raw);
+      }
+    }, 220);
+  }
 
   function showToast(msg: string) {
     setToast(msg);
@@ -83,22 +101,32 @@ export default function AdminPcScan() {
       const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items`, { method: "GET" });
       const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
 
-      // 映射成前端常用字段（✅ 加 last_updated_at 供“置顶排序”用）
-      const mapped = arr.map((x: any) => ({
-        id: x.id,
-        sku: x.sku,
-        barcode: x.barcode,
-        qty: toInt(x.expected_qty),
-        good_qty: toInt(x.good_qty),
-        damaged_qty: toInt(x.damaged_qty),
-        name_zh: x.name_zh,
-        name_es: x.name_es,
-        evidence_count: toInt(x.evidence_count),
-        evidence_photo_urls: Array.isArray(x.evidence_photo_urls) ? x.evidence_photo_urls : [],
-        locked: !!x.locked,
-        version: x.version,
-        last_updated_at: x.last_updated_at ?? x.lastUpdatedAt ?? x.updated_at ?? null,
-      }));
+      // ✅ 保留本地 pin_until（延长置顶，不会被轮询覆盖掉）
+      const pinMap = new Map<string, number>();
+      for (const it of items) {
+        if (it?.id && it?.pin_until) pinMap.set(String(it.id), toTs(it.pin_until));
+      }
+
+      const mapped = arr.map((x: any) => {
+        const id = String(x.id);
+        return {
+          id,
+          sku: x.sku,
+          barcode: x.barcode,
+          qty: toInt(x.expected_qty),
+          good_qty: toInt(x.good_qty),
+          damaged_qty: toInt(x.damaged_qty),
+          name_zh: x.name_zh,
+          name_es: x.name_es,
+          evidence_count: toInt(x.evidence_count),
+          evidence_photo_urls: Array.isArray(x.evidence_photo_urls) ? x.evidence_photo_urls : [],
+          locked: !!x.locked,
+          version: x.version,
+          last_updated_at: x.last_updated_at ?? x.lastUpdatedAt ?? x.updated_at ?? null,
+          // ✅ 恢复 pin_until（如果还没过期就继续有效）
+          pin_until: pinMap.get(id) || 0,
+        };
+      });
 
       setItems(mapped);
     } catch (e: any) {
@@ -113,7 +141,7 @@ export default function AdminPcScan() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
 
-  // PC 扫码枪：保持焦点（点页面空白也拉回）
+  // 保持焦点
   useEffect(() => {
     const focus = () => scanRef.current?.focus();
     focus();
@@ -131,11 +159,11 @@ export default function AdminPcScan() {
     });
   }
 
-  // ✅ 立刻写“本地更新时间”，保证命中 SKU 立即置顶（不用等轮询）
-  function stampPcLastUpdated(itemId: string) {
-    const now = Date.now();
+  // ✅ 命中 SKU：置顶延长（pin_until）
+  function pinItemToTop(itemId: string) {
+    const until = Date.now() + PIN_MS;
     setItems((prev) =>
-      prev.map((x) => (String(x?.id) === String(itemId) ? { ...x, last_updated_at: now } : x))
+      prev.map((x) => (String(x?.id) === String(itemId) ? { ...x, pin_until: until } : x))
     );
   }
 
@@ -149,7 +177,7 @@ export default function AdminPcScan() {
     if (last.code === v && now - last.ts < 900) return;
     lastCodeRef.current = { code: v, ts: now };
 
-    // 匹配：优先条码，其次允许手输 SKU
+    // 匹配：优先条码，其次 SKU
     const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
     const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === v) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
@@ -159,13 +187,11 @@ export default function AdminPcScan() {
       return;
     }
 
-    // ✅ 一扫码就切到「进行中」
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
     const expected = toInt(it.qty);
     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
-    const remain = Math.max(0, expected - done);
     const evi = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
     if (expected > 0 && done >= expected) {
@@ -173,16 +199,16 @@ export default function AdminPcScan() {
       return;
     }
 
-    // ✅ 命中 SKU：立刻置顶（先打时间戳）
-    if (it?.id) stampPcLastUpdated(String(it.id));
+    // ✅ 先置顶（延长显示），不等网络返回
+    if (it?.id) pinItemToTop(String(it.id));
 
     try {
-      // PC 默认良品 +1（破损模式后续再加）
       const res = await postScanIncrement(String(it.barcode), "good");
       const updated = res?.item ?? res?.data?.item ?? null;
 
       if (updated?.id) {
         const updatedId = String(updated.id);
+        const until = Date.now() + PIN_MS;
 
         setItems((prev) =>
           prev.map((x) =>
@@ -196,19 +222,15 @@ export default function AdminPcScan() {
                   evidence_photo_urls: Array.isArray(updated.evidence_photo_urls)
                     ? updated.evidence_photo_urls
                     : x.evidence_photo_urls,
-                  // ✅ 让“置顶排序”更稳定：优先用后端 last_updated_at，否则用 now
-                  last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? Date.now(),
+                  last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? x.last_updated_at,
+                  // ✅ 保证不会被轮询立刻压下去
+                  pin_until: until,
                 }
               : x
           )
         );
       } else {
         loadItems(true);
-      }
-
-      const newDone = done + 1;
-      if (expected > 0 && newDone >= expected) {
-        showToast(evi > 0 ? L("验货完毕", "Completado") : L("请添加证据", "Falta foto"));
       }
     } catch {
       showToast(L("网络/接口错误", "Error red/API"));
@@ -232,7 +254,7 @@ export default function AdminPcScan() {
       return hay.includes(kw);
     });
 
-    // ✅ 排序：状态优先，其次“最近扫码(last_updated_at)置顶”，最后 SKU
+    // ✅ 排序：状态优先，其次 pin_until（未过期置顶），再按 last_updated_at，最后 SKU
     list = list.sort((a, b) => {
       const sa = itemStatus(a);
       const sb = itemStatus(b);
@@ -241,6 +263,13 @@ export default function AdminPcScan() {
       const ra = rank(sa);
       const rb = rank(sb);
       if (ra !== rb) return ra - rb;
+
+      const now = Date.now();
+      const pa = toTs(a?.pin_until);
+      const pb = toTs(b?.pin_until);
+      const aPinned = pa > now ? pa : 0;
+      const bPinned = pb > now ? pb : 0;
+      if (aPinned !== bPinned) return bPinned - aPinned;
 
       const ta = toTs(a?.last_updated_at);
       const tb = toTs(b?.last_updated_at);
@@ -262,7 +291,8 @@ export default function AdminPcScan() {
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col">
       <Header title={L("PC 扫码枪验货", "PC Escáner")} onBack={() => nav("/admin/dashboard")} />
 
-      <main className="flex-1 w-full max-w-[980px] mx-auto px-4 pt-4 pb-6 space-y-3">
+      {/* ✅ 变宽：从 980 提到 1400，且保持居中 */}
+      <main className="flex-1 w-full max-w-[1400px] mx-auto px-6 pt-4 pb-6 space-y-3">
         {/* 顶部信息条 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
           <div>
@@ -273,20 +303,23 @@ export default function AdminPcScan() {
             </div>
           </div>
 
-          {/* 语言开关 */}
           <div className="flex items-center justify-end">
             <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
               <button
                 type="button"
                 onClick={() => setLang("zh")}
-                className={`h-8 px-3 rounded-full text-[12px] font-semibold ${lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
+                className={`h-8 px-3 rounded-full text-[12px] font-semibold ${
+                  lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
+                }`}
               >
                 ZH
               </button>
               <button
                 type="button"
                 onClick={() => setLang("es")}
-                className={`h-8 px-3 rounded-full text-[12px] font-semibold ${lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
+                className={`h-8 px-3 rounded-full text-[12px] font-semibold ${
+                  lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
+                }`}
               >
                 ES
               </button>
@@ -301,9 +334,13 @@ export default function AdminPcScan() {
             <input
               ref={scanRef}
               value={scanInput}
-              onChange={(e) => setScanInput(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                setScanInput(val);
+                scheduleAutoSubmit(val); // ✅ 恢复自动识别
+              }}
               onKeyDown={(e) => {
-                // 支持 Enter/Tab 两种扫码枪结尾
+                // 扫码枪 Enter/Tab 结尾：立即提交
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
                   const val = scanInput.trim();
@@ -329,21 +366,21 @@ export default function AdminPcScan() {
             </button>
           </div>
           <div className="mt-2 text-[12px] text-slate-400 font-semibold">
-            {L("提示：扫码枪通常会自动回车；本页支持 Enter/Tab 自动提交。", "Tip: soporte Enter/Tab automático.")}
+            {L("提示：扫码枪通常会自动回车；本页也支持“输入停顿自动提交”。", "Tip: soporte auto por pausa + Enter/Tab.")}
           </div>
         </div>
 
-        {/* 过滤/Tab */}
+        {/* 过滤/Tab + 列表 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder={L("搜索 SKU/条码/名称", "Buscar SKU/código")}
-              className="w-full md:w-[360px] h-11 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
+              className="w-full md:w-[420px] h-11 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
             />
 
-            <div className="grid grid-cols-3 gap-2 w-full md:w-[420px]">
+            <div className="grid grid-cols-3 gap-2 w-full md:w-[460px]">
               <button
                 onClick={() => setTab("pending")}
                 className={`h-10 rounded-2xl border text-[12px] font-extrabold ${
@@ -371,9 +408,9 @@ export default function AdminPcScan() {
             </div>
           </div>
 
-          {/* 列表（PC 表格风） */}
+          {/* 表格 */}
           <div className="mt-4 overflow-auto rounded-2xl border border-slate-200">
-            <table className="w-full min-w-[860px] bg-white">
+            <table className="w-full min-w-[1100px] bg-white">
               <thead className="bg-[#F4F6FA]">
                 <tr className="text-[12px] text-slate-600 font-extrabold">
                   <th className="text-left p-3">{L("SKU", "SKU")}</th>
@@ -419,6 +456,7 @@ export default function AdminPcScan() {
                     </tr>
                   );
                 })}
+
                 {filteredItems.length === 0 ? (
                   <tr>
                     <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={8}>
@@ -430,6 +468,7 @@ export default function AdminPcScan() {
             </table>
           </div>
 
+          {/* ✅ 版权放在页面背景上：保持只有一次、同样样式 */}
           <div className="pt-4 text-center text-[12px] text-slate-400">© PARKSONMX BS DU S.A. DE C.V.</div>
         </div>
       </main>
