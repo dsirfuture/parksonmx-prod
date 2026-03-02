@@ -1,4 +1,3 @@
-// src/App.tsx
 import React, { useEffect, useMemo, useState, createContext, useContext } from "react";
 import { HashRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 
@@ -108,23 +107,63 @@ const ReceiptsAutoSync: React.FC<{
   return null;
 };
 
-// ✅ 关键：根据路由决定用“手机壳”还是“PC 大屏容器”
+/** ✅ 关键：PC 路由不使用 max-w-[430px] 容器 */
 function AppShell({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const isPc = location.pathname.startsWith("/admin/pc");
 
   if (isPc) {
-    // PC：全宽，不要手机壳样式
+    // PC 大屏：全宽、左右留白、背景一致
     return <div className="min-h-screen bg-[#F4F6FA]">{children}</div>;
   }
 
-  // Mobile：保留你原来的手机壳
+  // Mobile：保持你原来的手机壳
   return (
     <div className="min-h-screen flex flex-col bg-[#F4F6FA] max-w-[430px] mx-auto shadow-2xl relative overflow-x-hidden">
       {children}
     </div>
   );
 }
+
+const AppRoutes: React.FC<{ receipts: Receipt[]; setReceipts: React.Dispatch<React.SetStateAction<Receipt[]>> }> = ({
+  receipts,
+  setReceipts,
+}) => {
+  return (
+    <AppShell>
+      {import.meta.env.VITE_PARKSONMX_BACKEND_MODE === "1" ? null : <ReceiptsAutoSync receipts={receipts} setReceipts={setReceipts} />}
+
+      <Routes>
+        <Route path="/" element={<RoleSelection />} />
+        <Route path="/role" element={<RoleSelection />} />
+
+        <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
+        <Route path="/admin/dashboard" element={<AdminDashboard />} />
+        <Route path="/admin/import" element={<ImportPage />} />
+        <Route path="/admin/export" element={<ExportPage />} />
+        <Route path="/admin/receipts/:receiptId" element={<ReceiptDetail />} />
+
+        {/* ✅ PC 专用入口 */}
+        <Route path="/admin/pc/scan" element={<AdminPcScan />} />
+
+        <Route path="/worker/scan" element={<WorkerScan />} />
+        <Route path="/worker/scan/*" element={<WorkerScan />} />
+        <Route path="/worker/items/:id" element={<ItemDetail mode="worker" />} />
+        <Route path="/worker/items/:id/done" element={<ItemDetail mode="worker" readOnlyOverride={true} />} />
+
+        {/* Share */}
+        <Route path="/share" element={<SharePage />} />
+        <Route path="/share/evidence" element={<ShareEvidencePage />} />
+        <Route path="/share/token" element={<TokenValidate />} />
+
+        <Route path="/customer/validate" element={<TokenValidate />} />
+        <Route path="/customer/items/:id" element={<ItemDetail mode="customer" />} />
+
+        <Route path="*" element={<Navigate to="/admin/dashboard" replace />} />
+      </Routes>
+    </AppShell>
+  );
+};
 
 const App: React.FC = () => {
   const [authData, setAuthData] = useState<Omit<AuthContextType, "setAuth">>({
@@ -168,39 +207,7 @@ const App: React.FC = () => {
     <AuthContext.Provider value={authValue}>
       <ReceiptContext.Provider value={{ receipts, setReceipts }}>
         <HashRouter>
-          <AppShell>
-            {import.meta.env.VITE_PARKSONMX_BACKEND_MODE === "1" ? null : (
-              <ReceiptsAutoSync receipts={receipts} setReceipts={setReceipts} />
-            )}
-
-            <Routes>
-              <Route path="/" element={<RoleSelection />} />
-              <Route path="/role" element={<RoleSelection />} />
-
-              <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
-              <Route path="/admin/dashboard" element={<AdminDashboard />} />
-              <Route path="/admin/import" element={<ImportPage />} />
-              <Route path="/admin/export" element={<ExportPage />} />
-              <Route path="/admin/receipts/:receiptId" element={<ReceiptDetail />} />
-
-              {/* ✅ PC 入口 */}
-              <Route path="/admin/pc/scan" element={<AdminPcScan />} />
-
-              <Route path="/worker/scan" element={<WorkerScan />} />
-              <Route path="/worker/scan/*" element={<WorkerScan />} />
-              <Route path="/worker/items/:id" element={<ItemDetail mode="worker" />} />
-              <Route path="/worker/items/:id/done" element={<ItemDetail mode="worker" readOnlyOverride={true} />} />
-
-              <Route path="/share" element={<SharePage />} />
-              <Route path="/share/evidence" element={<ShareEvidencePage />} />
-              <Route path="/share/token" element={<TokenValidate />} />
-
-              <Route path="/customer/validate" element={<TokenValidate />} />
-              <Route path="/customer/items/:id" element={<ItemDetail mode="customer" />} />
-
-              <Route path="*" element={<Navigate to="/admin/dashboard" replace />} />
-            </Routes>
-          </AppShell>
+          <AppRoutes receipts={receipts} setReceipts={setReceipts} />
         </HashRouter>
       </ReceiptContext.Provider>
     </AuthContext.Provider>
