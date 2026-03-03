@@ -3,6 +3,7 @@
 // ✅ 新增：每次扫码命中的 SKU，会在「进行中」列表置顶（按 lastCheckedAt 倒序）
 // ✅ 新增：支持“超收”显示（over_good_qty / over_damaged_qty）
 // ✅ 新增：数量已满后继续扫码 —— 不再拦截，会继续打 /scan，让后端记录超收
+// ✅ 新增：扫不到 SKU（item_not_found）时，提示是否登记为“异常到货”，确认后写入后端（/extras）
 // ✅ 语言：继续用你现有的 L(zh, es)，不会出现双语叠在一起
 // ✅ 其它逻辑尽量不动（扫码、统计、tab、UI风格保持一致）
 
@@ -115,7 +116,7 @@ function mapServerItemsToLocal(arr: any[]) {
     good_qty: toInt(x.good_qty),
     damaged_qty: toInt(x.damaged_qty),
 
-    // ✅ 新增：超收字段（来自后端）
+    // ✅ 超收字段
     over_good_qty: toInt(x.over_good_qty),
     over_damaged_qty: toInt(x.over_damaged_qty),
 
@@ -163,6 +164,25 @@ export default function WorkerScan() {
   function showToast(msg: string) {
     setToast(msg);
     window.setTimeout(() => setToast(""), 1200);
+  }
+
+  // ✅ 异常到货确认框（本页内，不用浏览器弹窗）
+  const [extraAsk, setExtraAsk] = useState<null | { barcode: string; mode: "good" | "damaged" }>(null);
+  const [extraSubmitting, setExtraSubmitting] = useState(false);
+
+  async function createExtraArrival(barcode: string, mode: "good" | "damaged") {
+    // 后端准备的接口（下一步我们会写）
+    // POST /api/receipts/{id}/extras
+    return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        barcode,
+        mode,
+        qty: 1,
+        device_id: deviceId,
+      }),
+    });
   }
 
   async function loadItemsFromServer(silent?: boolean) {
@@ -339,7 +359,7 @@ export default function WorkerScan() {
       cur.status = updated.status ?? cur.status;
       cur.version = updated.version ?? cur.version;
 
-      // ✅ 新增：超收字段回填
+      // ✅ 超收字段回填
       if (updated.over_good_qty != null) cur.over_good_qty = toInt(updated.over_good_qty);
       if (updated.over_damaged_qty != null) cur.over_damaged_qty = toInt(updated.over_damaged_qty);
 
@@ -400,14 +420,14 @@ export default function WorkerScan() {
     const idxBySku = source === "manual" ? items.findIndex((it) => norm(it?.sku) === v) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
 
+    // ✅ 扫不到：弹出“是否登记异常到货”
     if (idx === -1) {
       setScanInput("");
       setDamagedCount(0);
-      showToast(L("未匹配商品", "Sin producto"));
+      setExtraAsk({ barcode: String(raw || "").trim(), mode: damagedCount > 0 ? "damaged" : "good" });
       return;
     }
 
-    // ✅ 一扫码就切到「进行中」，并在列表置顶显示（靠 lastCheckedAt 倒序）
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
@@ -419,16 +439,14 @@ export default function WorkerScan() {
       : toInt(it?.evidence_photo_count ?? it?.evidence_count);
 
     // ✅ 不再拦截“数量已满”
-    // 仍然给一个提示，但继续请求后端，让后端记录 over_*
     if (expected > 0 && done >= expected) {
-      showToast(photoCount > 0 ? L("已满，继续扫码记录超收", "Lleno, registra Over") : L("已满，继续扫码记录超收", "Lleno, registra Over"));
+      showToast(L("已满，继续扫码记录超收", "Lleno, registra Over"));
     }
 
     // ✅ damagedCount：不再用 remain 限制（满了也允许产生超收）
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
     const timesDamaged = wantDamaged > 0 ? Math.min(99, wantDamaged) : 0;
 
-    // ✅ 关键：先写 lastCheckedAt，让“进行中列表”立即置顶（不用等后端轮询）
     stampCheckedAt(idx);
 
     try {
@@ -766,13 +784,13 @@ export default function WorkerScan() {
 
             <div className="mt-4 grid grid-cols-3 gap-2">
               <button onClick={() => setTab("pending")} className={`h-10 rounded-2xl border text-[12px] font-extrabold ${tabBtnCls("pending")}`}>
-                {L("待验货", "Pendiente")} ({stats.countPending})
+                {L("待验货", "Pendiente")}
               </button>
               <button onClick={() => setTab("doing")} className={`h-10 rounded-2xl border text-[12px] font-extrabold ${tabBtnCls("doing")}`}>
-                {L("进行中", "En curso")} ({stats.countDoing})
+                {L("进行中", "En curso")}
               </button>
               <button onClick={() => setTab("done")} className={`h-10 rounded-2xl border text-[12px] font-extrabold ${tabBtnCls("done")}`}>
-                {L("已完成", "Hecho")} ({stats.countDone})
+                {L("已完成", "Hecho")}
               </button>
             </div>
 
@@ -829,7 +847,7 @@ export default function WorkerScan() {
                       </div>
                     </div>
 
-                    {/* ✅ 这里改为 6 格：应验/良品/破损/相差/超收/证据按钮 */}
+                    {/* ✅ 6 格：应验/良品/破损/相差/超收/证据 */}
                     <div className="mt-3 grid grid-cols-6 gap-2">
                       <StatSquare label={L("应验", "Esperado")} value={expected} />
                       <StatSquare label={L("良品", "Bueno")} value={good} />
@@ -880,6 +898,61 @@ export default function WorkerScan() {
         className="absolute -left-[9999px] -top-[9999px] opacity-0 w-px h-px"
         onChange={(e) => commitEvidencePicked(e.target.files)}
       />
+
+      {/* ✅ 异常到货确认框 */}
+      {extraAsk ? (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end justify-center">
+          <div className="w-full max-w-[430px] bg-white rounded-t-[24px] border border-slate-200 p-4">
+            <div className="text-[14px] font-extrabold text-slate-900">{L("异常到货", "Extra arrival")}</div>
+            <div className="mt-2 text-[12px] text-slate-600 font-semibold break-all">
+              {L("该条码不在此验货单，是否登记为异常到货？", "No está en el recibo. ¿Registrar como extra?")}
+            </div>
+            <div className="mt-2 text-[12px] text-slate-500 font-semibold break-all">
+              {L("条码：", "Código: ")}
+              {extraAsk.barcode}
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <button
+                type="button"
+                onClick={() => setExtraAsk(null)}
+                className="flex-1 h-11 rounded-2xl border border-slate-200 bg-white text-slate-700 font-extrabold active:scale-[0.99]"
+                disabled={extraSubmitting}
+              >
+                {L("取消", "Cancelar")}
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const b = extraAsk.barcode;
+                  const m = extraAsk.mode;
+                  setExtraSubmitting(true);
+                  try {
+                    await createExtraArrival(b, m);
+                    showToast(L("已登记异常到货", "Registrado"));
+                    setExtraAsk(null);
+                  } catch (e: any) {
+                    const msg = String(e?.message || "");
+                    // 如果后端还没做 /extras，这里一般会 404
+                    if (String(e?.status || "").startsWith("404") || msg.includes("404") || msg.includes("NOT_FOUND")) {
+                      showToast(L("后端未启用异常到货接口", "API extra no listo"));
+                    } else {
+                      showToast(L("登记失败", "Error"));
+                    }
+                  } finally {
+                    setExtraSubmitting(false);
+                    setTimeout(() => scanInputRef.current?.focus(), 0);
+                  }
+                }}
+                className="flex-1 h-11 rounded-2xl bg-[#2F3C7E] text-white font-extrabold active:scale-[0.99]"
+                disabled={extraSubmitting}
+              >
+                {extraSubmitting ? L("提交中…", "Enviando…") : L("登记异常到货", "Registrar")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-50">
