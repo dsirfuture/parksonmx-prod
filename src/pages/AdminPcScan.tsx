@@ -133,7 +133,6 @@ export default function AdminPcScan() {
     autoTimerRef.current = window.setTimeout(() => {
       if (looksLikeNumericBarcode(raw)) {
         setScanInput("");
-        // 默认：扫码=良品；如果在异常 Tab，也照样累加异常良品
         submitScan(raw, "good");
       }
     }, 220);
@@ -157,8 +156,11 @@ export default function AdminPcScan() {
         qty: toInt(x.expected_qty),
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
+
+        // 超收
         over_good_qty: toInt(x.over_good_qty),
         over_damaged_qty: toInt(x.over_damaged_qty),
+
         name_zh: x.name_zh,
         name_es: x.name_es,
         evidence_count: toInt(x.evidence_count),
@@ -179,7 +181,7 @@ export default function AdminPcScan() {
     }
   }
 
-  // ✅ 异常池列表：独立拉取（后端实现后就能跨设备一致）
+  // ✅ 异常池列表：独立拉取
   async function loadExtras(silent?: boolean) {
     if (!receiptId) return;
     try {
@@ -219,7 +221,7 @@ export default function AdminPcScan() {
     scanRef.current?.focus();
   }, []);
 
-  // 支持 increment（给“破损+1”用）
+  // 正常扫码：支持 increment（给“破损+1”用）
   async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
@@ -245,25 +247,19 @@ export default function AdminPcScan() {
   }
 
   async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
-    const v = norm(raw);
-    if (!v) return;
+    const vNorm = norm(raw);
+    const rawTrim = String(raw || "").trim();
+    if (!vNorm || !rawTrim) return;
 
     const now = Date.now();
     const last = lastCodeRef.current;
-    if (last.code === `${mode}:${increment || 0}:${v}` && now - last.ts < 300) return;
-    lastCodeRef.current = { code: `${mode}:${increment || 0}:${v}`, ts: now };
-
-    // 先匹配正常 items
-    const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
-    const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === v) : -1;
-    const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
+    if (last.code === `${mode}:${increment || 0}:${vNorm}` && now - last.ts < 300) return;
+    lastCodeRef.current = { code: `${mode}:${increment || 0}:${vNorm}`, ts: now };
 
     // 如果当前在异常 Tab：优先当作异常条码累加（不走正常 items）
     if (tab === "extra") {
-      const barcode = String(raw || "").trim();
-      if (!barcode) return;
       try {
-        await postExtraIncrement(barcode, mode, increment || 1);
+        await postExtraIncrement(rawTrim, mode, increment || 1);
         await loadExtras(true);
         showToast(mode === "damaged" ? L("异常破损 +1", "Daño extra +1") : L("异常到货 +1", "Extra +1"));
       } catch {
@@ -272,9 +268,13 @@ export default function AdminPcScan() {
       return;
     }
 
+    // 先匹配正常 items（条码优先，其次 SKU）
+    const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === vNorm);
+    const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === vNorm) : -1;
+    const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
+
     // 正常 items 没匹配到：走异常登记
     if (idx === -1) {
-      const barcode = String(raw || "").trim();
       const ok = window.confirm(L("该条码不在此验货单，是否登记为异常到货？", "No está en recibo. ¿Registrar como extra?"));
       if (!ok) {
         showToast(L("已取消", "Cancelado"));
@@ -282,7 +282,7 @@ export default function AdminPcScan() {
       }
 
       try {
-        await postExtraIncrement(barcode, mode, increment || 1);
+        await postExtraIncrement(rawTrim, mode, increment || 1);
         await loadExtras(true);
         setTab("extra");
         showToast(L("已登记到异常到货", "Registrado en extra"));
@@ -358,11 +358,9 @@ export default function AdminPcScan() {
     const showDiff = doneTotal > 0 && rawDiff > 0;
     const diffTotal = showDiff ? rawDiff : 0;
 
-    const overTotal = items.reduce((s, it) => s + toInt(it.over_good_qty) + toInt(it.over_damaged_qty), 0);
-
     const pct = expectedTotal > 0 ? Math.round((doneTotal / expectedTotal) * 100) : 0;
 
-    return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct, overTotal };
+    return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct };
   }, [items]);
 
   const filteredItems = useMemo(() => {
@@ -472,7 +470,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 汇总（加一个“超收总数”不改变你原布局的列数的话会挤；这里保持 6 格不动） */}
+        {/* 汇总（保持 6 格） */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -535,7 +533,7 @@ export default function AdminPcScan() {
               className="w-full md:w-[520px] h-11 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
             />
 
-            {/* ✅ 4 个 Tab：新增“异常到货” */}
+            {/* ✅ 4 个 Tab */}
             <div className="grid grid-cols-4 gap-2 w-full md:w-[760px]">
               <button
                 onClick={() => setTab("pending")}
