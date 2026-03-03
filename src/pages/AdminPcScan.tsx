@@ -142,6 +142,11 @@ export default function AdminPcScan() {
         qty: toInt(x.expected_qty),
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
+
+        // ✅ 新增：超收字段（后端如果没返回就默认 0，不影响其他逻辑）
+        over_good_qty: toInt(x.over_good_qty),
+        over_damaged_qty: toInt(x.over_damaged_qty),
+
         name_zh: x.name_zh,
         name_es: x.name_es,
         evidence_count: toInt(x.evidence_count),
@@ -206,13 +211,13 @@ export default function AdminPcScan() {
     const it = items[idx];
     const expected = toInt(it.qty);
     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
-
     const photoCount = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
+    // ✅ 允许“已满继续扫”产生超收后，这里不再提前 return（否则看不到超收效果）
+    // 仍然给一个提示，但继续让后端处理（它会把增量进 over_*）
     if (expected > 0 && done >= expected) {
-      setPinnedItemId("");
-      showToast(photoCount > 0 ? L("验货完毕", "Completado") : L("请添加证据", "Falta foto"));
-      return;
+      showToast(photoCount > 0 ? L("已满，继续扫码将记为超收", "Lleno, contará como over") : L("已满，请补证据（可继续扫超收）", "Lleno, falta foto (over OK)"));
+      // 不 return
     }
 
     setPinnedItemId(String(it.id));
@@ -232,6 +237,11 @@ export default function AdminPcScan() {
                   good_qty: toInt(updated.good_qty),
                   damaged_qty: toInt(updated.damaged_qty),
                   qty: toInt(updated.expected_qty ?? x.qty),
+
+                  // ✅ 回填超收（后端返回就更新）
+                  over_good_qty: toInt((updated as any).over_good_qty ?? x.over_good_qty),
+                  over_damaged_qty: toInt((updated as any).over_damaged_qty ?? x.over_damaged_qty),
+
                   evidence_count: toInt(updated.evidence_count ?? x.evidence_count),
                   evidence_photo_urls: Array.isArray(updated.evidence_photo_urls) ? updated.evidence_photo_urls : x.evidence_photo_urls,
                   last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? x.last_updated_at ?? Date.now(),
@@ -364,7 +374,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 汇总 */}
+        {/* 汇总（不改布局） */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -458,15 +468,19 @@ export default function AdminPcScan() {
               <thead className="bg-[#F4F6FA]">
                 <tr className="text-[12px] text-slate-600 font-extrabold">
                   <th className="text-left p-3 w-[11%]">{L("SKU", "SKU")}</th>
-                  <th className="text-left p-3 w-[15%]">{L("条码", "Código")}</th>
-                  <th className="text-left p-3 w-[26%]">{L("名称", "Nombre")}</th>
+                  <th className="text-left p-3 w-[14%]">{L("条码", "Código")}</th>
+                  <th className="text-left p-3 w-[22%]">{L("名称", "Nombre")}</th>
                   <th className="text-center p-3 w-[6%]">{L("应验", "Exp")}</th>
                   <th className="text-center p-3 w-[6%]">{L("良品", "Buen")}</th>
                   <th className="text-center p-3 w-[6%]">{L("破损", "Daño")}</th>
                   <th className="text-center p-3 w-[10%]">{L("破损+1", "+1")}</th>
                   <th className="text-center p-3 w-[6%]">{L("相差", "Dif")}</th>
+
+                  {/* ✅ 新增：超收列（每个 SKU 显示） */}
+                  <th className="text-center p-3 w-[6%]">{L("超收", "Over")}</th>
+
                   <th className="text-center p-3 w-[5%]">{L("证据", "Foto")}</th>
-                  <th className="text-center p-3 w-[9%]">{L("状态", "Estado")}</th>
+                  <th className="text-center p-3 w-[8%]">{L("状态", "Estado")}</th>
                 </tr>
               </thead>
 
@@ -482,6 +496,8 @@ export default function AdminPcScan() {
                   const showDiff = done > 0 && rawDiff > 0;
                   const diffValue = showDiff ? rawDiff : 0;
 
+                  const over = toInt(it.over_good_qty) + toInt(it.over_damaged_qty);
+
                   const full = isQtyFull(it);
                   const isPinned = pinnedItemId && String(it.id) === String(pinnedItemId) && !full;
 
@@ -495,6 +511,7 @@ export default function AdminPcScan() {
                       <td className="p-3 break-words">
                         <div className="text-slate-900">{lang === "zh" ? it.name_zh || "-" : it.name_es || "-"}</div>
                       </td>
+
                       <td className="p-3 text-center">{expected}</td>
                       <td className="p-3 text-center">{toInt(it.good_qty)}</td>
                       <td className="p-3 text-center" style={{ color: toInt(it.damaged_qty) > 0 ? "#D32F2F" : "#0F172A" }}>
@@ -522,7 +539,14 @@ export default function AdminPcScan() {
                       <td className="p-3 text-center" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
                         {diffValue}
                       </td>
+
+                      {/* ✅ 超收（有值就红色） */}
+                      <td className="p-3 text-center" style={{ color: over > 0 ? "#D32F2F" : "#0F172A" }}>
+                        {over}
+                      </td>
+
                       <td className="p-3 text-center">{evi}</td>
+
                       <td className="p-3 text-center">
                         <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-extrabold ${badgeCls(s)}`}>
                           {lang === "zh"
@@ -542,7 +566,7 @@ export default function AdminPcScan() {
 
                 {filteredItems.length === 0 ? (
                   <tr>
-                    <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={10}>
+                    <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={11}>
                       {L("暂无数据", "Sin datos")}
                     </td>
                   </tr>
