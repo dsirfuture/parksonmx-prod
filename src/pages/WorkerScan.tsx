@@ -1,6 +1,8 @@
 // src/pages/WorkerScan.tsx
 // ✅ 证据不再存 dataURL 到本地：改为 presign -> PUT -> commit（进 DB，跨设备可见）
 // ✅ 新增：每次扫码命中的 SKU，会在「进行中」列表置顶（按 lastCheckedAt 倒序）
+// ✅ 新增：支持“超收”显示（over_good_qty / over_damaged_qty）
+// ✅ 新增：数量已满后继续扫码 —— 不再拦截，会继续打 /scan，让后端记录超收
 // ✅ 语言：继续用你现有的 L(zh, es)，不会出现双语叠在一起
 // ✅ 其它逻辑尽量不动（扫码、统计、tab、UI风格保持一致）
 
@@ -112,6 +114,11 @@ function mapServerItemsToLocal(arr: any[]) {
     qty: toInt(x.expected_qty),
     good_qty: toInt(x.good_qty),
     damaged_qty: toInt(x.damaged_qty),
+
+    // ✅ 新增：超收字段（来自后端）
+    over_good_qty: toInt(x.over_good_qty),
+    over_damaged_qty: toInt(x.over_damaged_qty),
+
     name_zh: x.name_zh,
     name_es: x.name_es,
     evidence_photo_urls: Array.isArray(x.evidence_photo_urls) ? x.evidence_photo_urls : [],
@@ -166,15 +173,16 @@ export default function WorkerScan() {
       const merged = mapServerItemsToLocal(arr);
 
       const sig = merged
-        .map((it: any) => `${it.id}:${it.good_qty}:${it.damaged_qty}:${it.qty}:${(it.evidence_photo_urls || []).length}`)
-        .join("|");
-      const curSig = items
         .map(
           (it: any) =>
-            `${it.id}:${toInt(it.good_qty)}:${toInt(it.damaged_qty)}:${toInt(it.qty)}:${
-              Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : 0
-            }`
+            `${it.id}:${it.good_qty}:${it.damaged_qty}:${it.over_good_qty}:${it.over_damaged_qty}:${it.qty}:${(it.evidence_photo_urls || []).length}`
         )
+        .join("|");
+      const curSig = items
+        .map((it: any) => {
+          const urlsLen = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : 0;
+          return `${it.id}:${toInt(it.good_qty)}:${toInt(it.damaged_qty)}:${toInt(it.over_good_qty)}:${toInt(it.over_damaged_qty)}:${toInt(it.qty)}:${urlsLen}`;
+        })
         .join("|");
 
       if (sig !== curSig) setItems(merged);
@@ -331,6 +339,10 @@ export default function WorkerScan() {
       cur.status = updated.status ?? cur.status;
       cur.version = updated.version ?? cur.version;
 
+      // ✅ 新增：超收字段回填
+      if (updated.over_good_qty != null) cur.over_good_qty = toInt(updated.over_good_qty);
+      if (updated.over_damaged_qty != null) cur.over_damaged_qty = toInt(updated.over_damaged_qty);
+
       if (Array.isArray(updated.evidence_photo_urls)) cur.evidence_photo_urls = updated.evidence_photo_urls;
       if (updated.evidence_count != null) cur.evidence_count = toInt(updated.evidence_count);
       if (updated.evidence_photo_count != null) cur.evidence_photo_count = toInt(updated.evidence_photo_count);
@@ -401,21 +413,20 @@ export default function WorkerScan() {
     const it = items[idx];
     const expected = toInt(it?.qty);
     const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
-    const remain = Math.max(0, expected - done);
 
     const photoCount = Array.isArray(it?.evidence_photo_urls)
       ? it.evidence_photo_urls.length
       : toInt(it?.evidence_photo_count ?? it?.evidence_count);
 
+    // ✅ 不再拦截“数量已满”
+    // 仍然给一个提示，但继续请求后端，让后端记录 over_*
     if (expected > 0 && done >= expected) {
-      showToast(photoCount > 0 ? L("验货完毕", "Completado") : L("请添加证据", "Falta foto"));
-      setScanInput("");
-      setDamagedCount(0);
-      return;
+      showToast(photoCount > 0 ? L("已满，继续扫码记录超收", "Lleno, registra Over") : L("已满，继续扫码记录超收", "Lleno, registra Over"));
     }
 
+    // ✅ damagedCount：不再用 remain 限制（满了也允许产生超收）
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
-    const timesDamaged = wantDamaged > 0 ? Math.min(remain, wantDamaged) : 0;
+    const timesDamaged = wantDamaged > 0 ? Math.min(99, wantDamaged) : 0;
 
     // ✅ 关键：先写 lastCheckedAt，让“进行中列表”立即置顶（不用等后端轮询）
     stampCheckedAt(idx);
@@ -777,6 +788,8 @@ export default function WorkerScan() {
                 const showDiff = done > 0 && rawDiff > 0;
                 const diffValue = showDiff ? rawDiff : 0;
 
+                const over = toInt(it?.over_good_qty) + toInt(it?.over_damaged_qty);
+
                 const photoCount = Array.isArray(it?.evidence_photo_urls)
                   ? it.evidence_photo_urls.length
                   : toInt(it?.evidence_photo_count ?? it?.evidence_count);
@@ -816,11 +829,13 @@ export default function WorkerScan() {
                       </div>
                     </div>
 
-                    <div className="mt-3 grid grid-cols-5 gap-2">
+                    {/* ✅ 这里改为 6 格：应验/良品/破损/相差/超收/证据按钮 */}
+                    <div className="mt-3 grid grid-cols-6 gap-2">
                       <StatSquare label={L("应验", "Esperado")} value={expected} />
                       <StatSquare label={L("良品", "Bueno")} value={good} />
                       <StatSquare label={L("破损", "Daño")} value={dmg} danger={dmg > 0} />
                       <StatSquare label={L("相差", "Dif")} value={diffValue} danger={showDiff} />
+                      <StatSquare label={L("超收", "Over")} value={over} danger={over > 0} />
 
                       <button
                         type="button"
