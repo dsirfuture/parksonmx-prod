@@ -30,7 +30,7 @@ function toTs(v: any): number {
   return Number.isFinite(t) ? t : 0;
 }
 
-type TabKey = "pending" | "doing" | "done";
+type TabKey = "pending" | "doing" | "done" | "extra";
 
 function itemStatus(it: any): "未验货" | "验货中" | "待证据" | "已完成" {
   const expected = toInt(it?.qty ?? it?.expected_qty);
@@ -86,6 +86,19 @@ async function downloadExportXlsx(receiptId: string, receiptNo: string) {
   URL.revokeObjectURL(href);
 }
 
+/** -------------------- 异常到货（前端结构） -------------------- */
+type ExtraItem = {
+  id: string;
+  barcode: string;
+  sku?: string | null;
+  name_zh?: string | null;
+  name_es?: string | null;
+  good_qty: number;
+  damaged_qty: number;
+  created_at?: any;
+  last_updated_at?: any;
+};
+
 export default function AdminPcScan() {
   const nav = useNavigate();
   const sp = useMemo(() => getQuery(), []);
@@ -97,6 +110,7 @@ export default function AdminPcScan() {
   const L = (zh: string, es: string) => (lang === "zh" ? zh : es);
 
   const [items, setItems] = useState<any[]>([]);
+  const [extras, setExtras] = useState<ExtraItem[]>([]);
   const [tab, setTab] = useState<TabKey>("doing");
   const [q, setQ] = useState("");
   const [toast, setToast] = useState("");
@@ -107,7 +121,7 @@ export default function AdminPcScan() {
   // 去重
   const lastCodeRef = useRef<{ code: string; ts: number }>({ code: "", ts: 0 });
 
-  // 置顶
+  // 置顶（只对正常 items 生效）
   const [pinnedItemId, setPinnedItemId] = useState<string>("");
 
   // 自动识别条码
@@ -119,6 +133,7 @@ export default function AdminPcScan() {
     autoTimerRef.current = window.setTimeout(() => {
       if (looksLikeNumericBarcode(raw)) {
         setScanInput("");
+        // 默认：扫码=良品；如果在异常 Tab，也照样累加异常良品
         submitScan(raw, "good");
       }
     }, 220);
@@ -142,11 +157,8 @@ export default function AdminPcScan() {
         qty: toInt(x.expected_qty),
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
-
-        // ✅ 新增：超收字段（后端如果没返回就默认 0，不影响其他逻辑）
         over_good_qty: toInt(x.over_good_qty),
         over_damaged_qty: toInt(x.over_damaged_qty),
-
         name_zh: x.name_zh,
         name_es: x.name_es,
         evidence_count: toInt(x.evidence_count),
@@ -167,9 +179,38 @@ export default function AdminPcScan() {
     }
   }
 
+  // ✅ 异常池列表：独立拉取（后端实现后就能跨设备一致）
+  async function loadExtras(silent?: boolean) {
+    if (!receiptId) return;
+    try {
+      const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, { method: "GET" });
+      const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
+      const mapped: ExtraItem[] = (arr || []).map((x: any) => ({
+        id: String(x.id),
+        barcode: String(x.barcode || ""),
+        sku: x.sku ?? null,
+        name_zh: x.name_zh ?? null,
+        name_es: x.name_es ?? null,
+        good_qty: toInt(x.good_qty),
+        damaged_qty: toInt(x.damaged_qty),
+        created_at: x.created_at,
+        last_updated_at: x.last_updated_at ?? x.updated_at ?? null,
+      }));
+      setExtras(mapped);
+    } catch {
+      if (!silent) {
+        // 不打扰主流程
+      }
+    }
+  }
+
   useEffect(() => {
     loadItems(false);
-    const t = window.setInterval(() => loadItems(true), 3000);
+    loadExtras(true);
+    const t = window.setInterval(() => {
+      loadItems(true);
+      loadExtras(true);
+    }, 3000);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiptId]);
@@ -188,6 +229,21 @@ export default function AdminPcScan() {
     });
   }
 
+  // ✅ 异常到货：新建/累加
+  async function postExtraIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
+    const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
+      body: JSON.stringify({
+        barcode,
+        mode,
+        increment: toInt(increment) || 1,
+        device_id: "pc-scanner",
+      }),
+    });
+  }
+
   async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
     const v = norm(raw);
     if (!v) return;
@@ -197,15 +253,46 @@ export default function AdminPcScan() {
     if (last.code === `${mode}:${increment || 0}:${v}` && now - last.ts < 300) return;
     lastCodeRef.current = { code: `${mode}:${increment || 0}:${v}`, ts: now };
 
+    // 先匹配正常 items
     const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === v);
     const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === v) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
 
-    if (idx === -1) {
-      showToast(L("未匹配商品", "Sin producto"));
+    // 如果当前在异常 Tab：优先当作异常条码累加（不走正常 items）
+    if (tab === "extra") {
+      const barcode = String(raw || "").trim();
+      if (!barcode) return;
+      try {
+        await postExtraIncrement(barcode, mode, increment || 1);
+        await loadExtras(true);
+        showToast(mode === "damaged" ? L("异常破损 +1", "Daño extra +1") : L("异常到货 +1", "Extra +1"));
+      } catch {
+        showToast(L("网络/接口错误", "Error red/API"));
+      }
       return;
     }
 
+    // 正常 items 没匹配到：走异常登记
+    if (idx === -1) {
+      const barcode = String(raw || "").trim();
+      const ok = window.confirm(L("该条码不在此验货单，是否登记为异常到货？", "No está en recibo. ¿Registrar como extra?"));
+      if (!ok) {
+        showToast(L("已取消", "Cancelado"));
+        return;
+      }
+
+      try {
+        await postExtraIncrement(barcode, mode, increment || 1);
+        await loadExtras(true);
+        setTab("extra");
+        showToast(L("已登记到异常到货", "Registrado en extra"));
+      } catch {
+        showToast(L("网络/接口错误", "Error red/API"));
+      }
+      return;
+    }
+
+    // 命中正常 items
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
@@ -213,11 +300,9 @@ export default function AdminPcScan() {
     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
     const photoCount = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
-    // ✅ 允许“已满继续扫”产生超收后，这里不再提前 return（否则看不到超收效果）
-    // 仍然给一个提示，但继续让后端处理（它会把增量进 over_*）
+    // ✅ 已满继续扫：不 return（让后端记超收）
     if (expected > 0 && done >= expected) {
-      showToast(photoCount > 0 ? L("已满，继续扫码将记为超收", "Lleno, contará como over") : L("已满，请补证据（可继续扫超收）", "Lleno, falta foto (over OK)"));
-      // 不 return
+      showToast(photoCount > 0 ? L("已满，继续扫码将记为超收", "Lleno, contará como over") : L("已满（可继续扫超收）", "Lleno (over OK)"));
     }
 
     setPinnedItemId(String(it.id));
@@ -237,11 +322,8 @@ export default function AdminPcScan() {
                   good_qty: toInt(updated.good_qty),
                   damaged_qty: toInt(updated.damaged_qty),
                   qty: toInt(updated.expected_qty ?? x.qty),
-
-                  // ✅ 回填超收（后端返回就更新）
                   over_good_qty: toInt((updated as any).over_good_qty ?? x.over_good_qty),
                   over_damaged_qty: toInt((updated as any).over_damaged_qty ?? x.over_damaged_qty),
-
                   evidence_count: toInt(updated.evidence_count ?? x.evidence_count),
                   evidence_photo_urls: Array.isArray(updated.evidence_photo_urls) ? updated.evidence_photo_urls : x.evidence_photo_urls,
                   last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? x.last_updated_at ?? Date.now(),
@@ -276,9 +358,11 @@ export default function AdminPcScan() {
     const showDiff = doneTotal > 0 && rawDiff > 0;
     const diffTotal = showDiff ? rawDiff : 0;
 
+    const overTotal = items.reduce((s, it) => s + toInt(it.over_good_qty) + toInt(it.over_damaged_qty), 0);
+
     const pct = expectedTotal > 0 ? Math.round((doneTotal / expectedTotal) * 100) : 0;
 
-    return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct };
+    return { skuCount, expectedTotal, goodTotal, damagedTotal, doneTotal, diffTotal, diffDanger: showDiff, pct, overTotal };
   }, [items]);
 
   const filteredItems = useMemo(() => {
@@ -315,8 +399,22 @@ export default function AdminPcScan() {
         const s = itemStatus(it);
         return s === "验货中" || s === "待证据";
       });
-    return list.filter((it) => itemStatus(it) === "已完成");
+    if (tab === "done") return list.filter((it) => itemStatus(it) === "已完成");
+    return list;
   }, [items, q, tab, pinnedItemId]);
+
+  const filteredExtras = useMemo(() => {
+    const kw = norm(q);
+    let list = extras.filter((x) => {
+      if (!kw) return true;
+      const hay = `${norm(x.barcode)} ${norm(x.sku)} ${norm(x.name_zh)} ${norm(x.name_es)}`;
+      return hay.includes(kw);
+    });
+
+    // 最新在上
+    list = list.sort((a, b) => toTs(b.last_updated_at) - toTs(a.last_updated_at));
+    return list;
+  }, [extras, q]);
 
   return (
     <div className="min-h-screen bg-[#F4F6FA] flex flex-col select-text" style={{ userSelect: "text" }}>
@@ -374,7 +472,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 汇总（不改布局） */}
+        {/* 汇总（加一个“超收总数”不改变你原布局的列数的话会挤；这里保持 6 格不动） */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -388,7 +486,9 @@ export default function AdminPcScan() {
 
         {/* 扫码输入 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-          <div className="text-[12px] text-slate-500 font-bold">{L("扫码枪输入", "Entrada escáner")}</div>
+          <div className="text-[12px] text-slate-500 font-bold">
+            {tab === "extra" ? L("异常到货扫码输入", "Entrada extra") : L("扫码枪输入", "Entrada escáner")}
+          </div>
           <div className="mt-2 flex gap-2">
             <input
               ref={scanRef}
@@ -406,7 +506,7 @@ export default function AdminPcScan() {
                   submitScan(val, "good");
                 }
               }}
-              placeholder={L("直接扫码条码（自动提交）", "Escanee código (auto)")}
+              placeholder={tab === "extra" ? L("扫码条码（自动登记/累加异常）", "Escanee (extra)") : L("直接扫码条码（自动提交）", "Escanee código (auto)")}
               className="flex-1 h-12 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[14px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
               autoCorrect="off"
               autoCapitalize="off"
@@ -435,7 +535,8 @@ export default function AdminPcScan() {
               className="w-full md:w-[520px] h-11 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
             />
 
-            <div className="grid grid-cols-3 gap-2 w-full md:w-[520px]">
+            {/* ✅ 4 个 Tab：新增“异常到货” */}
+            <div className="grid grid-cols-4 gap-2 w-full md:w-[760px]">
               <button
                 onClick={() => setTab("pending")}
                 className={`h-10 rounded-2xl border text-[12px] font-extrabold ${
@@ -460,120 +561,204 @@ export default function AdminPcScan() {
               >
                 {L("已完成", "Hecho")}
               </button>
+              <button
+                onClick={() => setTab("extra")}
+                className={`h-10 rounded-2xl border text-[12px] font-extrabold ${
+                  tab === "extra" ? "bg-[#FBEAEB] text-[#D32F2F] border-[#FBEAEB]" : "bg-white text-slate-700 border-slate-200"
+                }`}
+              >
+                {L("异常到货", "Extra")} ({extras.length})
+              </button>
             </div>
           </div>
 
-          <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
-            <table className="w-full table-fixed bg-white select-text">
-              <thead className="bg-[#F4F6FA]">
-                <tr className="text-[12px] text-slate-600 font-extrabold">
-                  <th className="text-left p-3 w-[11%]">{L("SKU", "SKU")}</th>
-                  <th className="text-left p-3 w-[14%]">{L("条码", "Código")}</th>
-                  <th className="text-left p-3 w-[22%]">{L("名称", "Nombre")}</th>
-                  <th className="text-center p-3 w-[6%]">{L("应验", "Exp")}</th>
-                  <th className="text-center p-3 w-[6%]">{L("良品", "Buen")}</th>
-                  <th className="text-center p-3 w-[6%]">{L("破损", "Daño")}</th>
-                  <th className="text-center p-3 w-[10%]">{L("破损+1", "+1")}</th>
-                  <th className="text-center p-3 w-[6%]">{L("相差", "Dif")}</th>
+          {/* ✅ 正常 SKU 列表 */}
+          {tab !== "extra" ? (
+            <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
+              <table className="w-full table-fixed bg-white select-text">
+                <thead className="bg-[#F4F6FA]">
+                  <tr className="text-[12px] text-slate-600 font-extrabold">
+                    <th className="text-left p-3 w-[11%]">{L("SKU", "SKU")}</th>
+                    <th className="text-left p-3 w-[14%]">{L("条码", "Código")}</th>
+                    <th className="text-left p-3 w-[22%]">{L("名称", "Nombre")}</th>
+                    <th className="text-center p-3 w-[6%]">{L("应验", "Exp")}</th>
+                    <th className="text-center p-3 w-[6%]">{L("良品", "Buen")}</th>
+                    <th className="text-center p-3 w-[6%]">{L("破损", "Daño")}</th>
+                    <th className="text-center p-3 w-[10%]">{L("破损+1", "+1")}</th>
+                    <th className="text-center p-3 w-[6%]">{L("相差", "Dif")}</th>
+                    <th className="text-center p-3 w-[6%]">{L("超收", "Over")}</th>
+                    <th className="text-center p-3 w-[5%]">{L("证据", "Foto")}</th>
+                    <th className="text-center p-3 w-[8%]">{L("状态", "Estado")}</th>
+                  </tr>
+                </thead>
 
-                  {/* ✅ 新增：超收列（每个 SKU 显示） */}
-                  <th className="text-center p-3 w-[6%]">{L("超收", "Over")}</th>
+                <tbody>
+                  {filteredItems.map((it) => {
+                    const s = itemStatus(it);
+                    const evi = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
-                  <th className="text-center p-3 w-[5%]">{L("证据", "Foto")}</th>
-                  <th className="text-center p-3 w-[8%]">{L("状态", "Estado")}</th>
-                </tr>
-              </thead>
+                    const expected = toInt(it.qty);
+                    const done = toInt(it.good_qty) + toInt(it.damaged_qty);
 
-              <tbody>
-                {filteredItems.map((it) => {
-                  const s = itemStatus(it);
-                  const evi = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
+                    const rawDiff = Math.max(0, expected - done);
+                    const showDiff = done > 0 && rawDiff > 0;
+                    const diffValue = showDiff ? rawDiff : 0;
 
-                  const expected = toInt(it.qty);
-                  const done = toInt(it.good_qty) + toInt(it.damaged_qty);
+                    const over = toInt(it.over_good_qty) + toInt(it.over_damaged_qty);
 
-                  const rawDiff = Math.max(0, expected - done);
-                  const showDiff = done > 0 && rawDiff > 0;
-                  const diffValue = showDiff ? rawDiff : 0;
+                    const full = isQtyFull(it);
+                    const isPinned = pinnedItemId && String(it.id) === String(pinnedItemId) && !full;
 
-                  const over = toInt(it.over_good_qty) + toInt(it.over_damaged_qty);
+                    return (
+                      <tr
+                        key={it.id}
+                        className={`border-t border-slate-200 text-[13px] font-semibold text-slate-800 ${isPinned ? "bg-[#FBEAEB]/40" : ""}`}
+                      >
+                        <td className="p-3 text-[#2F3C7E] font-extrabold break-words">{it.sku || "-"}</td>
+                        <td className="p-3 break-words">{it.barcode || "-"}</td>
+                        <td className="p-3 break-words">
+                          <div className="text-slate-900">{lang === "zh" ? it.name_zh || "-" : it.name_es || "-"}</div>
+                        </td>
 
-                  const full = isQtyFull(it);
-                  const isPinned = pinnedItemId && String(it.id) === String(pinnedItemId) && !full;
+                        <td className="p-3 text-center">{expected}</td>
+                        <td className="p-3 text-center">{toInt(it.good_qty)}</td>
+                        <td className="p-3 text-center" style={{ color: toInt(it.damaged_qty) > 0 ? "#D32F2F" : "#0F172A" }}>
+                          {toInt(it.damaged_qty)}
+                        </td>
 
-                  return (
-                    <tr
-                      key={it.id}
-                      className={`border-t border-slate-200 text-[13px] font-semibold text-slate-800 ${isPinned ? "bg-[#FBEAEB]/40" : ""}`}
-                    >
-                      <td className="p-3 text-[#2F3C7E] font-extrabold break-words">{it.sku || "-"}</td>
-                      <td className="p-3 break-words">{it.barcode || "-"}</td>
-                      <td className="p-3 break-words">
-                        <div className="text-slate-900">{lang === "zh" ? it.name_zh || "-" : it.name_es || "-"}</div>
-                      </td>
+                        <td className="p-3 text-center">
+                          <button
+                            type="button"
+                            disabled={full}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              submitScan(String(it.barcode || ""), "damaged", 1);
+                            }}
+                            className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
+                              full ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed" : "bg-white border-[#D32F2F] text-[#D32F2F]"
+                            }`}
+                            title={full ? L("数量已满", "Lleno") : L("破损+1", "Daño +1")}
+                          >
+                            {L("破损+1", "Daño+1")}
+                          </button>
+                        </td>
 
-                      <td className="p-3 text-center">{expected}</td>
-                      <td className="p-3 text-center">{toInt(it.good_qty)}</td>
-                      <td className="p-3 text-center" style={{ color: toInt(it.damaged_qty) > 0 ? "#D32F2F" : "#0F172A" }}>
-                        {toInt(it.damaged_qty)}
-                      </td>
+                        <td className="p-3 text-center" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
+                          {diffValue}
+                        </td>
 
-                      <td className="p-3 text-center">
-                        <button
-                          type="button"
-                          disabled={full}
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            submitScan(String(it.barcode || ""), "damaged", 1);
-                          }}
-                          className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
-                            full ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed" : "bg-white border-[#D32F2F] text-[#D32F2F]"
-                          }`}
-                          title={full ? L("数量已满", "Lleno") : L("破损+1", "Daño +1")}
-                        >
-                          {L("破损+1", "Daño+1")}
-                        </button>
-                      </td>
+                        <td className="p-3 text-center" style={{ color: over > 0 ? "#D32F2F" : "#0F172A" }}>
+                          {over}
+                        </td>
 
-                      <td className="p-3 text-center" style={{ color: showDiff ? "#D32F2F" : "#0F172A" }}>
-                        {diffValue}
-                      </td>
+                        <td className="p-3 text-center">{evi}</td>
 
-                      {/* ✅ 超收（有值就红色） */}
-                      <td className="p-3 text-center" style={{ color: over > 0 ? "#D32F2F" : "#0F172A" }}>
-                        {over}
-                      </td>
+                        <td className="p-3 text-center">
+                          <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-extrabold ${badgeCls(s)}`}>
+                            {lang === "zh"
+                              ? s
+                              : s === "未验货"
+                                ? "Pendiente"
+                                : s === "验货中"
+                                  ? "En curso"
+                                  : s === "待证据"
+                                    ? "Falta foto"
+                                    : "Hecho"}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
 
-                      <td className="p-3 text-center">{evi}</td>
-
-                      <td className="p-3 text-center">
-                        <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-extrabold ${badgeCls(s)}`}>
-                          {lang === "zh"
-                            ? s
-                            : s === "未验货"
-                              ? "Pendiente"
-                              : s === "验货中"
-                                ? "En curso"
-                                : s === "待证据"
-                                  ? "Falta foto"
-                                  : "Hecho"}
-                        </span>
+                  {filteredItems.length === 0 ? (
+                    <tr>
+                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={11}>
+                        {L("暂无数据", "Sin datos")}
                       </td>
                     </tr>
-                  );
-                })}
-
-                {filteredItems.length === 0 ? (
-                  <tr>
-                    <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={11}>
-                      {L("暂无数据", "Sin datos")}
-                    </td>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            /* ✅ 异常到货列表 */
+            <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
+              <table className="w-full table-fixed bg-white select-text">
+                <thead className="bg-[#F4F6FA]">
+                  <tr className="text-[12px] text-slate-600 font-extrabold">
+                    <th className="text-left p-3 w-[22%]">{L("条码", "Código")}</th>
+                    <th className="text-left p-3 w-[30%]">{L("名称/备注", "Nombre")}</th>
+                    <th className="text-center p-3 w-[10%]">{L("良品", "Buen")}</th>
+                    <th className="text-center p-3 w-[10%]">{L("破损", "Daño")}</th>
+                    <th className="text-center p-3 w-[14%]">{L("破损+1", "+1")}</th>
+                    <th className="text-center p-3 w-[14%]">{L("扫码+1", "+1")}</th>
                   </tr>
-                ) : null}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {filteredExtras.map((x) => {
+                    const name = lang === "zh" ? x.name_zh || x.sku || "-" : x.name_es || x.sku || "-";
+                    return (
+                      <tr key={x.id} className="border-t border-slate-200 text-[13px] font-semibold text-slate-800">
+                        <td className="p-3 break-words text-[#2F3C7E] font-extrabold">{x.barcode}</td>
+                        <td className="p-3 break-words">{name}</td>
+                        <td className="p-3 text-center">{toInt(x.good_qty)}</td>
+                        <td className="p-3 text-center" style={{ color: toInt(x.damaged_qty) > 0 ? "#D32F2F" : "#0F172A" }}>
+                          {toInt(x.damaged_qty)}
+                        </td>
+                        <td className="p-3 text-center">
+                          <button
+                            type="button"
+                            onClick={async (e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              try {
+                                await postExtraIncrement(String(x.barcode), "damaged", 1);
+                                await loadExtras(true);
+                                showToast(L("异常破损 +1", "Daño extra +1"));
+                              } catch {
+                                showToast(L("网络/接口错误", "Error red/API"));
+                              }
+                            }}
+                            className="h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap bg-white border-[#D32F2F] text-[#D32F2F]"
+                          >
+                            {L("破损+1", "Daño+1")}
+                          </button>
+                        </td>
+                        <td className="p-3 text-center">
+                          <button
+                            type="button"
+                            onClick={async (e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              try {
+                                await postExtraIncrement(String(x.barcode), "good", 1);
+                                await loadExtras(true);
+                                showToast(L("异常到货 +1", "Extra +1"));
+                              } catch {
+                                showToast(L("网络/接口错误", "Error red/API"));
+                              }
+                            }}
+                            className="h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap bg-white border-[#2F3C7E] text-[#2F3C7E]"
+                          >
+                            {L("扫码+1", "+1")}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+
+                  {filteredExtras.length === 0 ? (
+                    <tr>
+                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={6}>
+                        {L("暂无异常到货", "Sin extra")}
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           <div className="pt-4 text-center text-[12px] text-slate-400 select-text">© PARKSONMX BS DU S.A. DE C.V.</div>
         </div>
