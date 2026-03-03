@@ -1,7 +1,8 @@
+// src/pages/AdminPcScan.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Header } from "../components/Shared";
-import { apiFetch, apiFetchBlob } from "../api/http"; // ✅ 改：引入 apiFetchBlob
+import { apiFetch, apiFetchBlob } from "../api/http"; // ✅ 用 apiFetchBlob 导出（跨电脑可用）
 
 function getQuery() {
   const h = window.location.hash || "";
@@ -68,7 +69,7 @@ function SummarySquare({ label, value, danger }: { label: string; value: number;
   );
 }
 
-// ✅ 改：导出统一用 apiFetchBlob（自动走你项目统一鉴权 header，跨电脑也能用）
+/** ✅ 导出统一用 apiFetchBlob（自动用你 http.ts 的鉴权头，跨电脑可用） */
 async function downloadExportXlsx(receiptId: string, receiptNo: string) {
   const blob = await apiFetchBlob(`/api/receipts/${encodeURIComponent(receiptId)}/export.xlsx`, {
     method: "GET",
@@ -109,7 +110,7 @@ export default function AdminPcScan() {
   // 置顶
   const [pinnedItemId, setPinnedItemId] = useState<string>("");
 
-  // ✅ 自动识别条码（恢复）
+  // 自动识别条码
   const autoTimerRef = useRef<number | null>(null);
   function scheduleAutoSubmit(val: string) {
     if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
@@ -172,6 +173,7 @@ export default function AdminPcScan() {
     scanRef.current?.focus();
   }, []);
 
+  // 支持 increment（给“破损+1”用）
   async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
@@ -311,6 +313,7 @@ export default function AdminPcScan() {
       <Header title={L("PC 扫码枪验货", "PC Escáner")} onBack={() => nav("/admin/dashboard")} />
 
       <main className="flex-1 w-full max-w-[1400px] mx-auto px-6 pt-4 pb-6 space-y-3 select-text">
+        {/* 验货单号 / 总进度 / 导出表格 / 语言切换 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -345,18 +348,14 @@ export default function AdminPcScan() {
                 <button
                   type="button"
                   onClick={() => setLang("zh")}
-                  className={`h-8 px-3 rounded-full text-[12px] font-semibold ${
-                    lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
-                  }`}
+                  className={`h-8 px-3 rounded-full text-[12px] font-semibold ${lang === "zh" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
                 >
                   ZH
                 </button>
                 <button
                   type="button"
                   onClick={() => setLang("es")}
-                  className={`h-8 px-3 rounded-full text-[12px] font-semibold ${
-                    lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"
-                  }`}
+                  className={`h-8 px-3 rounded-full text-[12px] font-semibold ${lang === "es" ? "bg-[#2F3C7E] text-white" : "text-slate-600"}`}
                 >
                   ES
                 </button>
@@ -365,6 +364,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 汇总 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -376,6 +376,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 扫码输入 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="text-[12px] text-slate-500 font-bold">{L("扫码枪输入", "Entrada escáner")}</div>
           <div className="mt-2 flex gap-2">
@@ -414,6 +415,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 搜索/Tab + 列表 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <input
