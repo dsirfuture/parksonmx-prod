@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Header } from "../components/Shared";
-import { apiFetch, apiFetchBlob } from "../api/http"; // ✅ 用 apiFetchBlob 导出（跨电脑可用）
+import { apiFetch, apiFetchBlob } from "../api/http";
 
 function getQuery() {
   const h = window.location.hash || "";
@@ -46,7 +46,6 @@ function itemStatus(it: any): "未验货" | "验货中" | "待证据" | "已完�
   return "已完成";
 }
 
-// 数量满：只看数量，不等证据
 function isQtyFull(it: any) {
   const expected = toInt(it?.qty ?? it?.expected_qty);
   const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
@@ -69,7 +68,6 @@ function SummarySquare({ label, value, danger }: { label: string; value: number;
   );
 }
 
-/** ✅ 导出统一用 apiFetchBlob（自动用你 http.ts 的鉴权头，跨电脑可用） */
 async function downloadExportXlsx(receiptId: string, receiptNo: string) {
   const blob = await apiFetchBlob(`/api/receipts/${encodeURIComponent(receiptId)}/export.xlsx`, {
     method: "GET",
@@ -86,7 +84,6 @@ async function downloadExportXlsx(receiptId: string, receiptNo: string) {
   URL.revokeObjectURL(href);
 }
 
-/** -------------------- 异常到货（前端结构） -------------------- */
 type ExtraItem = {
   id: string;
   barcode: string;
@@ -118,13 +115,15 @@ export default function AdminPcScan() {
   const scanRef = useRef<HTMLInputElement | null>(null);
   const [scanInput, setScanInput] = useState("");
 
-  // 去重
   const lastCodeRef = useRef<{ code: string; ts: number }>({ code: "", ts: 0 });
-
-  // 置顶（只对正常 items 生效）
   const [pinnedItemId, setPinnedItemId] = useState<string>("");
 
-  // 自动识别条码
+  // ✅ 新增：编辑态
+  const [editingId, setEditingId] = useState<string>("");
+  const [editBarcode, setEditBarcode] = useState<string>("");
+  const [editPackQty, setEditPackQty] = useState<string>("1");
+  const [editSaving, setEditSaving] = useState(false);
+
   const autoTimerRef = useRef<number | null>(null);
   function scheduleAutoSubmit(val: string) {
     if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
@@ -152,15 +151,13 @@ export default function AdminPcScan() {
       const mapped = arr.map((x: any) => ({
         id: String(x.id),
         sku: x.sku,
-        barcode: x.barcode, // 允许为空
+        barcode: x.barcode ?? "",
         qty: toInt(x.expected_qty),
+        pack_qty: toInt(x.pack_qty) || 1, // ✅ 新增 pack_qty
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
-
-        // 超收
         over_good_qty: toInt(x.over_good_qty),
         over_damaged_qty: toInt(x.over_damaged_qty),
-
         name_zh: x.name_zh,
         name_es: x.name_es,
         evidence_count: toInt(x.evidence_count),
@@ -172,7 +169,8 @@ export default function AdminPcScan() {
 
       setItems(mapped);
 
-      if (pinnedItemId) {
+      // 如果正在编辑的那条被轮询刷新了，保持编辑框内容不被覆盖（只在 editingId 为空时自动刷新）
+      if (!editingId && pinnedItemId) {
         const pinned = mapped.find((x: any) => String(x.id) === String(pinnedItemId));
         if (pinned && isQtyFull(pinned)) setPinnedItemId("");
       }
@@ -181,7 +179,6 @@ export default function AdminPcScan() {
     }
   }
 
-  // ✅ 异常池列表：独立拉取
   async function loadExtras(silent?: boolean) {
     if (!receiptId) return;
     try {
@@ -201,7 +198,7 @@ export default function AdminPcScan() {
       setExtras(mapped);
     } catch {
       if (!silent) {
-        // 不打扰主流程
+        // ignore
       }
     }
   }
@@ -210,28 +207,27 @@ export default function AdminPcScan() {
     loadItems(false);
     loadExtras(true);
     const t = window.setInterval(() => {
-      loadItems(true);
+      // ✅ 编辑时不自动刷新 items，避免编辑输入被“轮询覆盖”
+      if (!editingId) loadItems(true);
       loadExtras(true);
     }, 3000);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [receiptId]);
+  }, [receiptId, editingId]);
 
   useEffect(() => {
     scanRef.current?.focus();
   }, []);
 
-  // 正常扫码：支持 increment（给“破损+1”用）
-  async function postScanIncrement(codeOrSkuOrBarcode: string, mode: "good" | "damaged", increment?: number) {
+  async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
-      body: JSON.stringify({ barcode: codeOrSkuOrBarcode, device_id: "pc-scanner", mode, increment }),
+      body: JSON.stringify({ barcode, device_id: "pc-scanner", mode, increment }),
     });
   }
 
-  // ✅ 异常到货：新建/累加
   async function postExtraIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, {
@@ -246,17 +242,64 @@ export default function AdminPcScan() {
     });
   }
 
+  // ✅ 新增：保存编辑
+  async function saveEdit(itemId: string) {
+    const bc = String(editBarcode ?? "").trim(); // 允许空
+    const pk = Math.max(1, toInt(editPackQty) || 1);
+
+    setEditSaving(true);
+    try {
+      const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ barcode: bc, pack_qty: pk }),
+      });
+
+      const updated = res?.data ?? res?.item ?? res;
+      if (updated?.id) {
+        setItems((prev) =>
+          prev.map((x) =>
+            String(x.id) === String(updated.id)
+              ? {
+                  ...x,
+                  barcode: String(updated.barcode ?? ""),
+                  pack_qty: toInt((updated as any).pack_qty) || pk,
+                  version: (updated as any).version ?? x.version,
+                  last_updated_at: (updated as any).last_updated_at ?? x.last_updated_at,
+                }
+              : x
+          )
+        );
+      } else {
+        // 兜底：重新拉
+        await loadItems(true);
+      }
+
+      showToast(L("已保存", "Guardado"));
+      setEditingId("");
+      setTimeout(() => scanRef.current?.focus(), 0);
+    } catch (e: any) {
+      const msg = String(e?.message || "");
+      if (msg.includes("BARCODE_DUPLICATE") || msg.includes("409")) {
+        showToast(L("条码重复，请换一个", "Código duplicado"));
+      } else {
+        showToast(L("保存失败", "Error guardar"));
+      }
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
   async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
+    const vNorm = norm(raw);
     const rawTrim = String(raw || "").trim();
-    const vNorm = norm(rawTrim);
-    if (!rawTrim || !vNorm) return;
+    if (!vNorm || !rawTrim) return;
 
     const now = Date.now();
     const last = lastCodeRef.current;
     if (last.code === `${mode}:${increment || 0}:${vNorm}` && now - last.ts < 300) return;
     lastCodeRef.current = { code: `${mode}:${increment || 0}:${vNorm}`, ts: now };
 
-    // 如果当前在异常 Tab：优先当作异常条码累加（不走正常 items）
     if (tab === "extra") {
       try {
         await postExtraIncrement(rawTrim, mode, increment || 1);
@@ -268,12 +311,10 @@ export default function AdminPcScan() {
       return;
     }
 
-    // 先匹配正常 items（条码优先，其次 SKU）
     const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === vNorm);
     const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === vNorm) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
 
-    // 正常 items 没匹配到：走异常登记
     if (idx === -1) {
       const ok = window.confirm(L("该条码不在此验货单，是否登记为异常到货？", "No está en recibo. ¿Registrar como extra?"));
       if (!ok) {
@@ -292,7 +333,6 @@ export default function AdminPcScan() {
       return;
     }
 
-    // 命中正常 items
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
@@ -300,18 +340,17 @@ export default function AdminPcScan() {
     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
     const photoCount = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
-    // ✅ 已满继续扫：不 return（让后端记超收）
     if (expected > 0 && done >= expected) {
       showToast(photoCount > 0 ? L("已满，继续扫码将记为超收", "Lleno, contará como over") : L("已满（可继续扫超收）", "Lleno (over OK)"));
     }
 
     setPinnedItemId(String(it.id));
 
-    // ✅ 关键：条码为空时，改用 SKU（否则 barcode="" 会导致后端查不到）
-    const sendCode = String(it.barcode || it.sku || rawTrim).trim();
-
     try {
-      const res = await postScanIncrement(sendCode, mode, increment);
+      // ✅ 注意：这里仍用 it.barcode 扫码；如果此 SKU 没条码，你们现在是“手动输入 SKU 提交”也能匹配，
+      // 但后端 scan 目前是按 barcode / sku 搜索后，再用 item.barcode 去 update，所以 item.barcode 允许为空时：
+      // 建议你后端 scan 已经支持“sku 作为输入”匹配（你之前已做过）。这里保持不变。
+      const res = await postScanIncrement(String(it.barcode || it.sku), mode, increment);
       const updated = res?.item ?? res?.data?.item ?? null;
 
       if (updated?.id) {
@@ -327,6 +366,8 @@ export default function AdminPcScan() {
                   qty: toInt(updated.expected_qty ?? x.qty),
                   over_good_qty: toInt((updated as any).over_good_qty ?? x.over_good_qty),
                   over_damaged_qty: toInt((updated as any).over_damaged_qty ?? x.over_damaged_qty),
+                  pack_qty: toInt((updated as any).pack_qty ?? x.pack_qty) || x.pack_qty,
+                  barcode: String((updated as any).barcode ?? x.barcode ?? ""),
                   evidence_count: toInt(updated.evidence_count ?? x.evidence_count),
                   evidence_photo_urls: Array.isArray(updated.evidence_photo_urls) ? updated.evidence_photo_urls : x.evidence_photo_urls,
                   last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? x.last_updated_at ?? Date.now(),
@@ -411,7 +452,6 @@ export default function AdminPcScan() {
       const hay = `${norm(x.barcode)} ${norm(x.sku)} ${norm(x.name_zh)} ${norm(x.name_es)}`;
       return hay.includes(kw);
     });
-
     list = list.sort((a, b) => toTs(b.last_updated_at) - toTs(a.last_updated_at));
     return list;
   }, [extras, q]);
@@ -421,7 +461,7 @@ export default function AdminPcScan() {
       <Header title={L("PC 扫码枪验货", "PC Escáner")} onBack={() => nav("/admin/dashboard")} />
 
       <main className="flex-1 w-full max-w-[1400px] mx-auto px-6 pt-4 pb-6 space-y-3 select-text">
-        {/* 验货单号 / 总进度 / 导出表格 / 语言切换 */}
+        {/* 顶部信息 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -472,7 +512,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
-        {/* 汇总（保持 6 格） */}
+        {/* 汇总 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -535,7 +575,6 @@ export default function AdminPcScan() {
               className="w-full md:w-[520px] h-11 rounded-2xl bg-[#F4F6FA] border border-slate-200 px-4 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
             />
 
-            {/* ✅ 4 个 Tab */}
             <div className="grid grid-cols-4 gap-2 w-full md:w-[760px]">
               <button
                 onClick={() => setTab("pending")}
@@ -572,15 +611,19 @@ export default function AdminPcScan() {
             </div>
           </div>
 
-          {/* ✅ 正常 SKU 列表 */}
+          {/* 正常 SKU 列表 */}
           {tab !== "extra" ? (
             <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
               <table className="w-full table-fixed bg-white select-text">
                 <thead className="bg-[#F4F6FA]">
                   <tr className="text-[12px] text-slate-600 font-extrabold">
-                    <th className="text-left p-3 w-[11%]">{L("SKU", "SKU")}</th>
+                    <th className="text-left p-3 w-[10%]">{L("SKU", "SKU")}</th>
                     <th className="text-left p-3 w-[14%]">{L("条码", "Código")}</th>
-                    <th className="text-left p-3 w-[22%]">{L("名称", "Nombre")}</th>
+
+                    {/* ✅ 新增：包装数列 */}
+                    <th className="text-center p-3 w-[6%]">{L("包装", "Pack")}</th>
+
+                    <th className="text-left p-3 w-[18%]">{L("名称", "Nombre")}</th>
                     <th className="text-center p-3 w-[6%]">{L("应验", "Exp")}</th>
                     <th className="text-center p-3 w-[6%]">{L("良品", "Buen")}</th>
                     <th className="text-center p-3 w-[6%]">{L("破损", "Daño")}</th>
@@ -588,7 +631,10 @@ export default function AdminPcScan() {
                     <th className="text-center p-3 w-[6%]">{L("相差", "Dif")}</th>
                     <th className="text-center p-3 w-[6%]">{L("超收", "Over")}</th>
                     <th className="text-center p-3 w-[5%]">{L("证据", "Foto")}</th>
-                    <th className="text-center p-3 w-[8%]">{L("状态", "Estado")}</th>
+                    <th className="text-center p-3 w-[7%]">{L("状态", "Estado")}</th>
+
+                    {/* ✅ 新增：编辑列 */}
+                    <th className="text-center p-3 w-[6%]">{L("编辑", "Edit")}</th>
                   </tr>
                 </thead>
 
@@ -609,13 +655,40 @@ export default function AdminPcScan() {
                     const full = isQtyFull(it);
                     const isPinned = pinnedItemId && String(it.id) === String(pinnedItemId) && !full;
 
+                    const isEditing = editingId && String(editingId) === String(it.id);
+
                     return (
-                      <tr
-                        key={it.id}
-                        className={`border-t border-slate-200 text-[13px] font-semibold text-slate-800 ${isPinned ? "bg-[#FBEAEB]/40" : ""}`}
-                      >
+                      <tr key={it.id} className={`border-t border-slate-200 text-[13px] font-semibold text-slate-800 ${isPinned ? "bg-[#FBEAEB]/40" : ""}`}>
                         <td className="p-3 text-[#2F3C7E] font-extrabold break-words">{it.sku || "-"}</td>
-                        <td className="p-3 break-words">{it.barcode || "-"}</td>
+
+                        {/* 条码：编辑态输入框 */}
+                        <td className="p-3 break-words">
+                          {isEditing ? (
+                            <input
+                              value={editBarcode}
+                              onChange={(e) => setEditBarcode(e.target.value)}
+                              className="w-full h-9 rounded-xl bg-[#F4F6FA] border border-slate-200 px-3 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
+                              placeholder={L("可为空", "Puede vacío")}
+                            />
+                          ) : (
+                            it.barcode || "-"
+                          )}
+                        </td>
+
+                        {/* 包装数：编辑态输入框 */}
+                        <td className="p-3 text-center">
+                          {isEditing ? (
+                            <input
+                              value={editPackQty}
+                              onChange={(e) => setEditPackQty(e.target.value)}
+                              className="w-full h-9 rounded-xl bg-[#F4F6FA] border border-slate-200 px-2 text-center text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
+                              inputMode="numeric"
+                            />
+                          ) : (
+                            toInt(it.pack_qty) || 1
+                          )}
+                        </td>
+
                         <td className="p-3 break-words">
                           <div className="text-slate-900">{lang === "zh" ? it.name_zh || "-" : it.name_es || "-"}</div>
                         </td>
@@ -633,7 +706,6 @@ export default function AdminPcScan() {
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              // ✅ 条码为空时也能 +1：传 barcode||sku
                               submitScan(String(it.barcode || it.sku || ""), "damaged", 1);
                             }}
                             className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
@@ -668,13 +740,59 @@ export default function AdminPcScan() {
                                     : "Hecho"}
                           </span>
                         </td>
+
+                        {/* ✅ 编辑按钮：编辑/保存/取消 */}
+                        <td className="p-3 text-center">
+                          {!isEditing ? (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setEditingId(String(it.id));
+                                setEditBarcode(String(it.barcode ?? ""));
+                                setEditPackQty(String(toInt(it.pack_qty) || 1));
+                              }}
+                              className="h-9 px-3 rounded-2xl border font-extrabold text-[12px] bg-white border-slate-200 text-slate-700 active:scale-[0.99]"
+                            >
+                              {L("编辑", "Edit")}
+                            </button>
+                          ) : (
+                            <div className="flex items-center justify-center gap-2">
+                              <button
+                                type="button"
+                                disabled={editSaving}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  saveEdit(String(it.id));
+                                }}
+                                className="h-9 px-3 rounded-2xl bg-[#2F3C7E] text-white font-extrabold text-[12px] active:scale-[0.99] disabled:opacity-60"
+                              >
+                                {editSaving ? L("保存中", "Saving") : L("保存", "Save")}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={editSaving}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setEditingId("");
+                                }}
+                                className="h-9 px-3 rounded-2xl border font-extrabold text-[12px] bg-white border-slate-200 text-slate-700 active:scale-[0.99] disabled:opacity-60"
+                              >
+                                {L("取消", "Cancel")}
+                              </button>
+                            </div>
+                          )}
+                        </td>
                       </tr>
                     );
                   })}
 
                   {filteredItems.length === 0 ? (
                     <tr>
-                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={11}>
+                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={13}>
                         {L("暂无数据", "Sin datos")}
                       </td>
                     </tr>
@@ -683,7 +801,7 @@ export default function AdminPcScan() {
               </table>
             </div>
           ) : (
-            /* ✅ 异常到货列表 */
+            /* 异常到货列表（不改） */
             <div className="mt-4 rounded-2xl border border-slate-200 overflow-hidden">
               <table className="w-full table-fixed bg-white select-text">
                 <thead className="bg-[#F4F6FA]">
