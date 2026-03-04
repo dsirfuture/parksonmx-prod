@@ -62,7 +62,7 @@ function badgeCls(s: string) {
 function SummarySquare({ label, value, danger }: { label: string; value: number; danger?: boolean }) {
   return (
     <div className="w-full rounded-xl bg-[#F4F6FA] border border-slate-200 px-2 py-2 flex flex-col items-center justify-center leading-tight select-text">
-      <div className="text-[11px] text-slate-500 font-normal">{label}</div>
+      <div className="text-[11px] text-slate-500 font-bold">{label}</div>
       <div className={`mt-1 text-[16px] font-bold ${danger ? "text-[#D32F2F]" : "text-slate-900"}`}>{value}</div>
     </div>
   );
