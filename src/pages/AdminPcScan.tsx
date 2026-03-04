@@ -32,30 +32,32 @@ function toTs(v: any): number {
 
 type TabKey = "pending" | "doing" | "done" | "extra";
 
-function itemStatus(it: any): "未验货" | "验货中" | "待证据" | "已完成" {
+/**
+ * ✅ PC 端：不再强制证据才算完成
+ * 规则：
+ * - done=0 => 未验货
+ * - done<expected => 验货中
+ * - done>=expected => 已完成
+ */
+function itemStatusPc(it: any): "未验货" | "验货中" | "已完成" {
   const expected = toInt(it?.qty ?? it?.expected_qty);
   const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
-  const photoCount = Array.isArray(it?.evidence_photo_urls)
-    ? it.evidence_photo_urls.length
-    : toInt(it?.evidence_count ?? it?.evidence_photo_count);
-
   if (expected <= 0) return "未验货";
   if (done <= 0) return "未验货";
   if (done < expected) return "验货中";
-  if (photoCount <= 0) return "待证据";
   return "已完成";
 }
 
+// 数量满：只看数量
 function isQtyFull(it: any) {
   const expected = toInt(it?.qty ?? it?.expected_qty);
   const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
   return expected > 0 && done >= expected;
 }
 
-function badgeCls(s: string) {
+function badgeClsPc(s: string) {
   if (s === "未验货") return "bg-[#2F3C7E]/10 text-[#2F3C7E] border-slate-200";
   if (s === "验货中") return "bg-[#E8F5E9] text-[#2E7D32] border-slate-200";
-  if (s === "待证据") return "bg-[#FBEAEB] text-[#D32F2F] border-slate-200";
   return "bg-[#FBEAEB] text-[#2F3C7E] border-slate-200";
 }
 
@@ -68,6 +70,7 @@ function SummarySquare({ label, value, danger }: { label: string; value: number;
   );
 }
 
+/** 导出统一用 apiFetchBlob（自动用你 http.ts 的鉴权头，跨电脑可用） */
 async function downloadExportXlsx(receiptId: string, receiptNo: string) {
   const blob = await apiFetchBlob(`/api/receipts/${encodeURIComponent(receiptId)}/export.xlsx`, {
     method: "GET",
@@ -97,12 +100,11 @@ type ExtraItem = {
   last_updated_at?: any;
 };
 
-/** -------------------- 编辑（本地状态） -------------------- */
-type EditState = {
-  itemId: string;
-  barcode: string;
-  pack_qty: string; // 用 string 方便输入
-  saving: boolean;
+/** -------------------- 整单证据（前端结构） -------------------- */
+type ReceiptEvidence = {
+  id: string;
+  file_url: string;
+  created_at?: any;
 };
 
 export default function AdminPcScan() {
@@ -124,11 +126,19 @@ export default function AdminPcScan() {
   const scanRef = useRef<HTMLInputElement | null>(null);
   const [scanInput, setScanInput] = useState("");
 
+  // 去重
   const lastCodeRef = useRef<{ code: string; ts: number }>({ code: "", ts: 0 });
+
+  // 置顶（只对正常 items 生效）
   const [pinnedItemId, setPinnedItemId] = useState<string>("");
 
-  const [edit, setEdit] = useState<EditState | null>(null);
+  // ✅ 整单证据弹窗
+  const [receiptEviOpen, setReceiptEviOpen] = useState(false);
+  const [receiptEvis, setReceiptEvis] = useState<ReceiptEvidence[]>([]);
+  const [receiptEviBusy, setReceiptEviBusy] = useState(false);
+  const receiptEviInputRef = useRef<HTMLInputElement | null>(null);
 
+  // 自动识别条码
   const autoTimerRef = useRef<number | null>(null);
   function scheduleAutoSubmit(val: string) {
     if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
@@ -156,15 +166,15 @@ export default function AdminPcScan() {
       const mapped = arr.map((x: any) => ({
         id: String(x.id),
         sku: x.sku,
-        barcode: x.barcode ?? "",
-        pack_qty: toInt(x.pack_qty) || 1,
-
+        barcode: x.barcode,
         qty: toInt(x.expected_qty),
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
 
         over_good_qty: toInt(x.over_good_qty),
         over_damaged_qty: toInt(x.over_damaged_qty),
+
+        pack_qty: toInt(x.pack_qty),
 
         name_zh: x.name_zh,
         name_es: x.name_es,
@@ -210,12 +220,30 @@ export default function AdminPcScan() {
     }
   }
 
+  async function loadReceiptEvidence(silent?: boolean) {
+    if (!receiptId) return;
+    try {
+      const res = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/evidence`, { method: "GET" });
+      const arr = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
+      const mapped: ReceiptEvidence[] = (arr || []).map((x: any) => ({
+        id: String(x.id),
+        file_url: String(x.file_url || ""),
+        created_at: x.created_at,
+      }));
+      setReceiptEvis(mapped);
+    } catch {
+      if (!silent) showToast(L("拉取此单证据失败", "Error cargar evidencia"));
+    }
+  }
+
   useEffect(() => {
     loadItems(false);
     loadExtras(true);
+    loadReceiptEvidence(true);
     const t = window.setInterval(() => {
       loadItems(true);
       loadExtras(true);
+      loadReceiptEvidence(true);
     }, 3000);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -225,16 +253,17 @@ export default function AdminPcScan() {
     scanRef.current?.focus();
   }, []);
 
-  async function postScanIncrement(inputForScan: string, mode: "good" | "damaged", increment?: number) {
+  // 正常扫码：支持 increment（给“破损+1”用）
+  async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
-      // ✅ 注意：后端 scan 里字段叫 barcode，但我们可以把 SKU 放在这里传过去做匹配
-      body: JSON.stringify({ barcode: inputForScan, device_id: "pc-scanner", mode, increment }),
+      body: JSON.stringify({ barcode, device_id: "pc-scanner", mode, increment }),
     });
   }
 
+  // 异常到货：新建/累加
   async function postExtraIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, {
@@ -249,15 +278,6 @@ export default function AdminPcScan() {
     });
   }
 
-  async function patchItem(itemId: string, data: { barcode?: string; pack_qty?: number }) {
-    const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
-    return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/items/${encodeURIComponent(itemId)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
-      body: JSON.stringify(data),
-    });
-  }
-
   async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
     const vNorm = norm(raw);
     const rawTrim = String(raw || "").trim();
@@ -268,6 +288,7 @@ export default function AdminPcScan() {
     if (last.code === `${mode}:${increment || 0}:${vNorm}` && now - last.ts < 300) return;
     lastCodeRef.current = { code: `${mode}:${increment || 0}:${vNorm}`, ts: now };
 
+    // 如果当前在异常 Tab：优先当作异常条码累加
     if (tab === "extra") {
       try {
         await postExtraIncrement(rawTrim, mode, increment || 1);
@@ -279,17 +300,18 @@ export default function AdminPcScan() {
       return;
     }
 
+    // 先匹配正常 items（条码优先，其次 SKU）
     const idxByBarcode = items.findIndex((it) => norm(it?.barcode) === vNorm);
     const idxBySku = idxByBarcode === -1 ? items.findIndex((it) => norm(it?.sku) === vNorm) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
 
+    // 没匹配到：走异常登记
     if (idx === -1) {
       const ok = window.confirm(L("该条码不在此验货单，是否登记为异常到货？", "No está en recibo. ¿Registrar como extra?"));
       if (!ok) {
         showToast(L("已取消", "Cancelado"));
         return;
       }
-
       try {
         await postExtraIncrement(rawTrim, mode, increment || 1);
         await loadExtras(true);
@@ -301,23 +323,22 @@ export default function AdminPcScan() {
       return;
     }
 
+    // 命中正常 items
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
     const expected = toInt(it.qty);
     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
-    const photoCount = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
+    // ✅ 已满继续扫：不 return（让后端记超收）
     if (expected > 0 && done >= expected) {
-      showToast(photoCount > 0 ? L("已满，继续扫码将记为超收", "Lleno, contará como over") : L("已满（可继续扫超收）", "Lleno (over OK)"));
+      showToast(L("已满，继续扫码将记为超收", "Lleno, contará como over"));
     }
 
     setPinnedItemId(String(it.id));
 
     try {
-      // ✅ 关键：无条码商品，必须用 SKU 去打 /scan
-      const inputForScan = String(it.barcode || "").trim() ? String(it.barcode).trim() : String(it.sku).trim();
-      const res = await postScanIncrement(inputForScan, mode, increment);
+      const res = await postScanIncrement(String(it.barcode), mode, increment);
       const updated = res?.item ?? res?.data?.item ?? null;
 
       if (updated?.id) {
@@ -328,16 +349,13 @@ export default function AdminPcScan() {
             String(x.id) === updatedId
               ? {
                   ...x,
-                  barcode: String((updated as any).barcode ?? x.barcode ?? ""),
-                  pack_qty: toInt((updated as any).pack_qty ?? x.pack_qty) || 1,
-
                   good_qty: toInt(updated.good_qty),
                   damaged_qty: toInt(updated.damaged_qty),
                   qty: toInt(updated.expected_qty ?? x.qty),
-
+                  pack_qty: toInt((updated as any).pack_qty ?? x.pack_qty),
+                  barcode: String((updated as any).barcode ?? x.barcode),
                   over_good_qty: toInt((updated as any).over_good_qty ?? x.over_good_qty),
                   over_damaged_qty: toInt((updated as any).over_damaged_qty ?? x.over_damaged_qty),
-
                   evidence_count: toInt(updated.evidence_count ?? x.evidence_count),
                   evidence_photo_urls: Array.isArray(updated.evidence_photo_urls) ? updated.evidence_photo_urls : x.evidence_photo_urls,
                   last_updated_at: updated.last_updated_at ?? updated.lastUpdatedAt ?? x.last_updated_at ?? Date.now(),
@@ -358,6 +376,77 @@ export default function AdminPcScan() {
       }
     } catch {
       showToast(L("网络/接口错误", "Error red/API"));
+    }
+  }
+
+  // ✅ 此单证据：presign -> PUT -> commit
+  async function uploadReceiptEvidence(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const picked = Array.from(files);
+    if (picked.length === 0) return;
+
+    // 前端限制：最多 100
+    const remain = Math.max(0, 100 - receiptEvis.length);
+    if (remain <= 0) {
+      showToast(L("此单证据已达 100 张上限", "Límite 100"));
+      return;
+    }
+    const willUpload = picked.slice(0, remain);
+
+    setReceiptEviBusy(true);
+    try {
+      for (const file of willUpload) {
+        // 1) presign
+        const presignRes = await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/evidence/presign`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filename: file.name,
+            content_type: file.type || "application/octet-stream",
+            file_size: file.size,
+            type: "photo",
+          }),
+        });
+
+        const p = presignRes?.data ?? presignRes;
+        const uploadUrl = p?.upload_url || p?.uploadUrl || p?.put_url || p?.putUrl || p?.url;
+        const fileUrl = p?.file_url || p?.fileUrl || p?.public_url || p?.publicUrl || p?.key;
+        const checksum = p?.checksum || "";
+
+        if (!uploadUrl || !fileUrl) throw new Error("presign_invalid");
+
+        // 2) PUT upload
+        const putRes = await fetch(uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (!putRes.ok) throw new Error("upload_failed");
+
+        // 3) commit
+        const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
+        await apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/evidence/commit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
+          body: JSON.stringify({
+            type: "photo",
+            file_url: fileUrl,
+            mime_type: file.type || "application/octet-stream",
+            file_size: file.size,
+            checksum,
+          }),
+        });
+      }
+
+      await loadReceiptEvidence(true);
+      showToast(L("此单证据已上传", "Evidencia subida"));
+    } catch (e: any) {
+      showToast(`${L("上传失败", "Error subir")}: ${String(e?.message || "")}`.slice(0, 120));
+    } finally {
+      setReceiptEviBusy(false);
+      try {
+        if (receiptEviInputRef.current) receiptEviInputRef.current.value = "";
+      } catch {}
     }
   }
 
@@ -386,9 +475,9 @@ export default function AdminPcScan() {
     });
 
     list = list.sort((a, b) => {
-      const sa = itemStatus(a);
-      const sb = itemStatus(b);
-      const rank = (s: string) => (s === "未验货" ? 0 : s === "验货中" || s === "待证据" ? 1 : 2);
+      const sa = itemStatusPc(a);
+      const sb = itemStatusPc(b);
+      const rank = (s: string) => (s === "未验货" ? 0 : s === "验货中" ? 1 : 2);
 
       const ra = rank(sa);
       const rb = rank(sb);
@@ -405,13 +494,9 @@ export default function AdminPcScan() {
       return String(a?.sku || "").localeCompare(String(b?.sku || ""));
     });
 
-    if (tab === "pending") return list.filter((it) => itemStatus(it) === "未验货");
-    if (tab === "doing")
-      return list.filter((it) => {
-        const s = itemStatus(it);
-        return s === "验货中" || s === "待证据";
-      });
-    if (tab === "done") return list.filter((it) => itemStatus(it) === "已完成");
+    if (tab === "pending") return list.filter((it) => itemStatusPc(it) === "未验货");
+    if (tab === "doing") return list.filter((it) => itemStatusPc(it) === "验货中");
+    if (tab === "done") return list.filter((it) => itemStatusPc(it) === "已完成");
     return list;
   }, [items, q, tab, pinnedItemId]);
 
@@ -422,6 +507,7 @@ export default function AdminPcScan() {
       const hay = `${norm(x.barcode)} ${norm(x.sku)} ${norm(x.name_zh)} ${norm(x.name_es)}`;
       return hay.includes(kw);
     });
+
     list = list.sort((a, b) => toTs(b.last_updated_at) - toTs(a.last_updated_at));
     return list;
   }, [extras, q]);
@@ -431,6 +517,7 @@ export default function AdminPcScan() {
       <Header title={L("PC 扫码枪验货", "PC Escáner")} onBack={() => nav("/admin/dashboard")} />
 
       <main className="flex-1 w-full max-w-[1400px] mx-auto px-6 pt-4 pb-6 space-y-3 select-text">
+        {/* 顶部条 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -438,7 +525,7 @@ export default function AdminPcScan() {
               <div className="mt-1 text-[#2F3C7E] font-extrabold text-[18px] break-all">{receiptNo}</div>
             </div>
 
-            <div className="flex items-center gap-4 shrink-0">
+            <div className="flex items-center gap-3 shrink-0">
               <div className="text-[12px] text-slate-500 font-semibold whitespace-nowrap">
                 {L("总进度", "Progreso")}:{" "}
                 <span className="text-slate-900 font-extrabold">
@@ -461,6 +548,19 @@ export default function AdminPcScan() {
                 {L("导出表格", "Exportar")}
               </button>
 
+              {/* ✅ 新增：此单证据 */}
+              <button
+                type="button"
+                onClick={async () => {
+                  setReceiptEviOpen(true);
+                  await loadReceiptEvidence(true);
+                }}
+                className="h-10 px-4 rounded-2xl bg-white border border-slate-200 text-slate-800 font-extrabold active:scale-[0.99] whitespace-nowrap"
+                title={L("上传/查看此单证据（最多100张）", "Evidencia del recibo (max 100)")}
+              >
+                {L("此单证据", "Evidencia")} ({receiptEvis.length})
+              </button>
+
               <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
                 <button
                   type="button"
@@ -481,6 +581,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 汇总 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="grid grid-cols-6 gap-2">
             <SummarySquare label="SKU" value={stats.skuCount} />
@@ -492,6 +593,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 扫码输入 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="text-[12px] text-slate-500 font-bold">
             {tab === "extra" ? L("异常到货扫码输入", "Entrada extra") : L("扫码枪输入", "Entrada escáner")}
@@ -532,6 +634,7 @@ export default function AdminPcScan() {
           </div>
         </div>
 
+        {/* 搜索/Tab + 列表 */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <input
@@ -582,29 +685,28 @@ export default function AdminPcScan() {
               <table className="w-full table-fixed bg-white select-text">
                 <thead className="bg-[#F4F6FA]">
                   <tr className="text-[12px] text-slate-600 font-extrabold">
-                    <th className="text-left p-3 w-[10%]">{L("SKU", "SKU")}</th>
-                    <th className="text-left p-3 w-[13%]">{L("条码", "Código")}</th>
-                    <th className="text-left p-3 w-[20%]">{L("名称", "Nombre")}</th>
-                    <th className="text-center p-3 w-[5%]">{L("包装", "Pack")}</th>
+                    <th className="text-left p-3 w-[11%]">{L("SKU", "SKU")}</th>
+                    <th className="text-left p-3 w-[14%]">{L("条码", "Código")}</th>
+                    <th className="text-left p-3 w-[22%]">{L("名称", "Nombre")}</th>
                     <th className="text-center p-3 w-[6%]">{L("应验", "Exp")}</th>
                     <th className="text-center p-3 w-[6%]">{L("良品", "Buen")}</th>
                     <th className="text-center p-3 w-[6%]">{L("破损", "Daño")}</th>
                     <th className="text-center p-3 w-[10%]">{L("破损+1", "+1")}</th>
                     <th className="text-center p-3 w-[6%]">{L("相差", "Dif")}</th>
                     <th className="text-center p-3 w-[6%]">{L("超收", "Over")}</th>
-                    <th className="text-center p-3 w-[4%]">{L("证据", "Foto")}</th>
-                    <th className="text-center p-3 w-[6%]">{L("状态", "Estado")}</th>
-                    <th className="text-center p-3 w-[6%]">{L("编辑", "Edit")}</th>
+                    <th className="text-center p-3 w-[5%]">{L("证据", "Foto")}</th>
+                    <th className="text-center p-3 w-[8%]">{L("状态", "Estado")}</th>
                   </tr>
                 </thead>
 
                 <tbody>
                   {filteredItems.map((it) => {
-                    const s = itemStatus(it);
+                    const s = itemStatusPc(it);
                     const evi = Array.isArray(it.evidence_photo_urls) ? it.evidence_photo_urls.length : toInt(it.evidence_count);
 
                     const expected = toInt(it.qty);
                     const done = toInt(it.good_qty) + toInt(it.damaged_qty);
+
                     const rawDiff = Math.max(0, expected - done);
                     const showDiff = done > 0 && rawDiff > 0;
                     const diffValue = showDiff ? rawDiff : 0;
@@ -614,43 +716,15 @@ export default function AdminPcScan() {
                     const full = isQtyFull(it);
                     const isPinned = pinnedItemId && String(it.id) === String(pinnedItemId) && !full;
 
-                    const isEditing = edit && edit.itemId === String(it.id);
-
                     return (
                       <tr
                         key={it.id}
                         className={`border-t border-slate-200 text-[13px] font-semibold text-slate-800 ${isPinned ? "bg-[#FBEAEB]/40" : ""}`}
                       >
                         <td className="p-3 text-[#2F3C7E] font-extrabold break-words">{it.sku || "-"}</td>
-
-                        <td className="p-3 break-words">
-                          {isEditing ? (
-                            <input
-                              value={edit?.barcode ?? ""}
-                              onChange={(e) => setEdit((p) => (p ? { ...p, barcode: e.target.value } : p))}
-                              className="w-full h-9 rounded-xl bg-white border border-slate-200 px-2 text-[13px] font-semibold outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
-                              placeholder={L("可为空", "Puede vacío")}
-                            />
-                          ) : (
-                            it.barcode || "-"
-                          )}
-                        </td>
-
+                        <td className="p-3 break-words">{it.barcode || "-"}</td>
                         <td className="p-3 break-words">
                           <div className="text-slate-900">{lang === "zh" ? it.name_zh || "-" : it.name_es || "-"}</div>
-                        </td>
-
-                        <td className="p-3 text-center">
-                          {isEditing ? (
-                            <input
-                              value={edit?.pack_qty ?? "1"}
-                              onChange={(e) => setEdit((p) => (p ? { ...p, pack_qty: e.target.value } : p))}
-                              className="w-full h-9 rounded-xl bg-white border border-slate-200 px-2 text-[13px] font-semibold text-center outline-none focus:ring-2 focus:ring-[#2F3C7E]/20"
-                              inputMode="numeric"
-                            />
-                          ) : (
-                            toInt(it.pack_qty) || 1
-                          )}
                         </td>
 
                         <td className="p-3 text-center">{expected}</td>
@@ -662,15 +736,15 @@ export default function AdminPcScan() {
                         <td className="p-3 text-center">
                           <button
                             type="button"
-                            disabled={false /* 满了也允许超收，按钮不禁用 */}
+                            disabled={full}
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              // ✅ 破损+1 也要支持无条码 SKU：submitScan 会自己匹配后用 sku/条码正确请求
                               submitScan(String(it.barcode || it.sku || ""), "damaged", 1);
                             }}
-                            className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap bg-white border-[#D32F2F] text-[#D32F2F]`}
-                            title={L("破损+1", "Daño +1")}
+                            className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
+                              full ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed" : "bg-white border-[#D32F2F] text-[#D32F2F]"
+                            }`}
                           >
                             {L("破损+1", "Daño+1")}
                           </button>
@@ -684,89 +758,13 @@ export default function AdminPcScan() {
                           {over}
                         </td>
 
+                        {/* ✅ SKU 证据列仍显示，但不再影响完成状态 */}
                         <td className="p-3 text-center">{evi}</td>
 
                         <td className="p-3 text-center">
-                          <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-extrabold ${badgeCls(s)}`}>
-                            {lang === "zh"
-                              ? s
-                              : s === "未验货"
-                                ? "Pendiente"
-                                : s === "验货中"
-                                  ? "En curso"
-                                  : s === "待证据"
-                                    ? "Falta foto"
-                                    : "Hecho"}
+                          <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-extrabold ${badgeClsPc(s)}`}>
+                            {lang === "zh" ? s : s === "未验货" ? "Pendiente" : s === "验货中" ? "En curso" : "Hecho"}
                           </span>
-                        </td>
-
-                        <td className="p-3 text-center">
-                          {!isEditing ? (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEdit({
-                                  itemId: String(it.id),
-                                  barcode: String(it.barcode ?? ""),
-                                  pack_qty: String(toInt(it.pack_qty) || 1),
-                                  saving: false,
-                                });
-                              }}
-                              className="h-9 px-3 rounded-2xl border border-[#2F3C7E] text-[#2F3C7E] bg-white font-extrabold text-[12px] active:scale-[0.99]"
-                            >
-                              {L("编辑", "Edit")}
-                            </button>
-                          ) : (
-                            <div className="flex items-center justify-center gap-2">
-                              <button
-                                type="button"
-                                onClick={() => setEdit(null)}
-                                disabled={!!edit?.saving}
-                                className="h-9 px-3 rounded-2xl border border-slate-200 text-slate-700 bg-white font-extrabold text-[12px] active:scale-[0.99]"
-                              >
-                                {L("取消", "Cancel")}
-                              </button>
-                              <button
-                                type="button"
-                                disabled={!!edit?.saving}
-                                onClick={async () => {
-                                  if (!edit) return;
-                                  const bc = String(edit.barcode ?? "").trim(); // 允许为空
-                                  const pq = Math.max(1, toInt(edit.pack_qty) || 1);
-
-                                  setEdit((p) => (p ? { ...p, saving: true } : p));
-                                  try {
-                                    const res = await patchItem(edit.itemId, { barcode: bc, pack_qty: pq });
-                                    const updated = res?.item ?? res?.data?.item;
-                                    if (updated?.id) {
-                                      setItems((prev) =>
-                                        prev.map((x) =>
-                                          String(x.id) === String(updated.id)
-                                            ? {
-                                                ...x,
-                                                barcode: String((updated as any).barcode ?? x.barcode ?? ""),
-                                                pack_qty: toInt((updated as any).pack_qty ?? x.pack_qty) || 1,
-                                              }
-                                            : x
-                                        )
-                                      );
-                                    } else {
-                                      await loadItems(true);
-                                    }
-                                    showToast(L("保存成功", "Guardado"));
-                                    setEdit(null);
-                                  } catch (e: any) {
-                                    // 你之前的 Failed to fetch 大概率就是 CORS PATCH 没放行
-                                    showToast(`${L("保存失败", "Error")}: ${String(e?.message || "Failed")}`.slice(0, 80));
-                                    setEdit((p) => (p ? { ...p, saving: false } : p));
-                                  }
-                                }}
-                                className="h-9 px-3 rounded-2xl bg-[#2F3C7E] text-white font-extrabold text-[12px] active:scale-[0.99]"
-                              >
-                                {edit?.saving ? L("保存中…", "Saving…") : L("保存", "Save")}
-                              </button>
-                            </div>
-                          )}
                         </td>
                       </tr>
                     );
@@ -774,7 +772,7 @@ export default function AdminPcScan() {
 
                   {filteredItems.length === 0 ? (
                     <tr>
-                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={13}>
+                      <td className="p-6 text-center text-[12px] text-slate-400 font-semibold" colSpan={11}>
                         {L("暂无数据", "Sin datos")}
                       </td>
                     </tr>
@@ -863,6 +861,79 @@ export default function AdminPcScan() {
           <div className="pt-4 text-center text-[12px] text-slate-400 select-text">© PARKSONMX BS DU S.A. DE C.V.</div>
         </div>
       </main>
+
+      {/* ✅ 整单证据弹窗 */}
+      {receiptEviOpen ? (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center px-4">
+          <div className="w-full max-w-[1100px] bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+              <div className="font-extrabold text-slate-900">{L("此单证据", "Evidencia del recibo")}</div>
+              <div className="flex items-center gap-2">
+                <div className="text-[12px] text-slate-500 font-semibold">{receiptEvis.length}/100</div>
+                <button
+                  type="button"
+                  onClick={() => setReceiptEviOpen(false)}
+                  className="h-9 px-3 rounded-2xl border border-slate-200 bg-white text-slate-700 font-extrabold"
+                >
+                  {L("关闭", "Cerrar")}
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-[12px] text-slate-500 font-semibold">
+                  {L("上传图片（最多 100 张）", "Subir imágenes (máx 100)")}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    ref={receiptEviInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => uploadReceiptEvidence(e.target.files)}
+                  />
+                  <button
+                    type="button"
+                    disabled={receiptEviBusy || receiptEvis.length >= 100}
+                    onClick={() => receiptEviInputRef.current?.click()}
+                    className={`h-10 px-4 rounded-2xl font-extrabold ${
+                      receiptEviBusy || receiptEvis.length >= 100
+                        ? "bg-slate-100 border border-slate-200 text-slate-400 cursor-not-allowed"
+                        : "bg-[#2F3C7E] text-white"
+                    }`}
+                  >
+                    {receiptEviBusy ? L("上传中…", "Subiendo…") : L("上传图片", "Subir")}
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
+                {receiptEvis.map((x) => (
+                  <a
+                    key={x.id}
+                    href={x.file_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block rounded-xl overflow-hidden border border-slate-200 bg-[#F4F6FA]"
+                    title={x.file_url}
+                  >
+                    <img src={x.file_url} alt="" className="w-full h-[120px] object-cover" />
+                  </a>
+                ))}
+
+                {receiptEvis.length === 0 ? (
+                  <div className="col-span-full text-center text-[12px] text-slate-400 font-semibold py-10">
+                    {L("暂无此单证据", "Sin evidencia")}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-50">
