@@ -152,7 +152,7 @@ export default function AdminPcScan() {
       const mapped = arr.map((x: any) => ({
         id: String(x.id),
         sku: x.sku,
-        barcode: x.barcode,
+        barcode: x.barcode, // 允许为空
         qty: toInt(x.expected_qty),
         good_qty: toInt(x.good_qty),
         damaged_qty: toInt(x.damaged_qty),
@@ -222,12 +222,12 @@ export default function AdminPcScan() {
   }, []);
 
   // 正常扫码：支持 increment（给“破损+1”用）
-  async function postScanIncrement(barcode: string, mode: "good" | "damaged", increment?: number) {
+  async function postScanIncrement(codeOrSkuOrBarcode: string, mode: "good" | "damaged", increment?: number) {
     const idem = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": idem },
-      body: JSON.stringify({ barcode, device_id: "pc-scanner", mode, increment }),
+      body: JSON.stringify({ barcode: codeOrSkuOrBarcode, device_id: "pc-scanner", mode, increment }),
     });
   }
 
@@ -247,9 +247,9 @@ export default function AdminPcScan() {
   }
 
   async function submitScan(raw: string, mode: "good" | "damaged", increment?: number) {
-    const vNorm = norm(raw);
     const rawTrim = String(raw || "").trim();
-    if (!vNorm || !rawTrim) return;
+    const vNorm = norm(rawTrim);
+    if (!rawTrim || !vNorm) return;
 
     const now = Date.now();
     const last = lastCodeRef.current;
@@ -307,8 +307,11 @@ export default function AdminPcScan() {
 
     setPinnedItemId(String(it.id));
 
+    // ✅ 关键：条码为空时，改用 SKU（否则 barcode="" 会导致后端查不到）
+    const sendCode = String(it.barcode || it.sku || rawTrim).trim();
+
     try {
-      const res = await postScanIncrement(String(it.barcode), mode, increment);
+      const res = await postScanIncrement(sendCode, mode, increment);
       const updated = res?.item ?? res?.data?.item ?? null;
 
       if (updated?.id) {
@@ -409,7 +412,6 @@ export default function AdminPcScan() {
       return hay.includes(kw);
     });
 
-    // 最新在上
     list = list.sort((a, b) => toTs(b.last_updated_at) - toTs(a.last_updated_at));
     return list;
   }, [extras, q]);
@@ -631,7 +633,8 @@ export default function AdminPcScan() {
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              submitScan(String(it.barcode || ""), "damaged", 1);
+                              // ✅ 条码为空时也能 +1：传 barcode||sku
+                              submitScan(String(it.barcode || it.sku || ""), "damaged", 1);
                             }}
                             className={`h-9 px-2 rounded-2xl border font-extrabold text-[12px] active:scale-[0.99] whitespace-nowrap ${
                               full ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed" : "bg-white border-[#D32F2F] text-[#D32F2F]"
