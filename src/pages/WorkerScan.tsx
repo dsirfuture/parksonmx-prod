@@ -1,11 +1,10 @@
 // src/pages/WorkerScan.tsx
 // ✅ 证据不再存 dataURL 到本地：改为 presign -> PUT -> commit（进 DB，跨设备可见）
-// ✅ 新增：每次扫码命中的 SKU，会在「进行中」列表置顶（按 lastCheckedAt 倒序）
-// ✅ 新增：支持“超收”显示（over_good_qty / over_damaged_qty）
-// ✅ 新增：数量已满后继续扫码 —— 不再拦截，会继续打 /scan，让后端记录超收
-// ✅ 新增：扫不到 SKU（item_not_found）时，提示是否登记为“异常到货”，确认后写入后端（/extras）
-// ✅ 语言：继续用你现有的 L(zh, es)，不会出现双语叠在一起
-// ✅ 其它逻辑尽量不动（扫码、统计、tab、UI风格保持一致）
+// ✅ 每次扫码命中的 SKU，会在「进行中」列表置顶（按 lastCheckedAt 倒序）
+// ✅ 支持“超收”显示（over_good_qty / over_damaged_qty）
+// ✅ 数量已满后继续扫码 —— 不再拦截，会继续打 /scan，让后端记录超收
+// ✅ 扫不到 SKU（item_not_found）时，提示是否登记为“异常到货”，确认后写入后端（/extras）
+// ✅ 修复：无条码 SKU 时，用 SKU 也能正常提交 /scan（以前传空 barcode 导致接口失败）
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Scan, Search, Camera } from "lucide-react";
@@ -171,15 +170,14 @@ export default function WorkerScan() {
   const [extraSubmitting, setExtraSubmitting] = useState(false);
 
   async function createExtraArrival(barcode: string, mode: "good" | "damaged") {
-    // 后端准备的接口（下一步我们会写）
-    // POST /api/receipts/{id}/extras
+    // ✅ 这里用 increment（不是 qty）
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/extras`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         barcode,
         mode,
-        qty: 1,
+        increment: 1,
         device_id: deviceId,
       }),
     });
@@ -324,12 +322,14 @@ export default function WorkerScan() {
     }
   }
 
-  async function postScanIncrement(barcode: string, mode: "good" | "damaged") {
+  // ✅ 统一：scan 接口的 input 既可以是 barcode，也可以是 sku（后端 scan/route.ts 已支持）
+  async function postScanIncrement(input: string, mode: "good" | "damaged") {
+    const code = String(input || "").trim();
     const idem = makeIdempotencyKey(deviceId);
     return apiFetch<any>(`/api/receipts/${encodeURIComponent(receiptId)}/scan`, {
       method: "POST",
       headers: { "Idempotency-Key": idem, "Content-Type": "application/json" },
-      body: JSON.stringify({ barcode, device_id: deviceId, mode }),
+      body: JSON.stringify({ barcode: code, device_id: deviceId, mode }),
     });
   }
 
@@ -359,7 +359,6 @@ export default function WorkerScan() {
       cur.status = updated.status ?? cur.status;
       cur.version = updated.version ?? cur.version;
 
-      // ✅ 超收字段回填
       if (updated.over_good_qty != null) cur.over_good_qty = toInt(updated.over_good_qty);
       if (updated.over_damaged_qty != null) cur.over_damaged_qty = toInt(updated.over_damaged_qty);
 
@@ -420,30 +419,35 @@ export default function WorkerScan() {
     const idxBySku = source === "manual" ? items.findIndex((it) => norm(it?.sku) === v) : -1;
     const idx = idxByBarcode !== -1 ? idxByBarcode : idxBySku;
 
-    // ✅ 扫不到：弹出“是否登记异常到货”
+    // 扫不到：弹出“是否登记异常到货”
     if (idx === -1) {
+      const rawStr = String(raw || "").trim();
       setScanInput("");
       setDamagedCount(0);
-      setExtraAsk({ barcode: String(raw || "").trim(), mode: damagedCount > 0 ? "damaged" : "good" });
+      setExtraAsk({ barcode: rawStr, mode: damagedCount > 0 ? "damaged" : "good" });
       return;
     }
 
     if (tab !== "doing") setTab("doing");
 
     const it = items[idx];
+
+    // ✅ 修复：无条码时，用 sku 当 input 传给 /scan（后端会按 sku 匹配）
+    const inputForScan = String(it?.barcode || it?.sku || raw || "").trim();
+    if (!inputForScan) {
+      showToast(L("该SKU缺少条码且SKU为空", "Falta código y SKU"));
+      setScanInput("");
+      setDamagedCount(0);
+      return;
+    }
+
     const expected = toInt(it?.qty);
     const done = toInt(it?.good_qty) + toInt(it?.damaged_qty);
 
-    const photoCount = Array.isArray(it?.evidence_photo_urls)
-      ? it.evidence_photo_urls.length
-      : toInt(it?.evidence_photo_count ?? it?.evidence_count);
-
-    // ✅ 不再拦截“数量已满”
     if (expected > 0 && done >= expected) {
       showToast(L("已满，继续扫码记录超收", "Lleno, registra Over"));
     }
 
-    // ✅ damagedCount：不再用 remain 限制（满了也允许产生超收）
     const wantDamaged = Math.max(0, Math.floor(damagedCount));
     const timesDamaged = wantDamaged > 0 ? Math.min(99, wantDamaged) : 0;
 
@@ -452,12 +456,12 @@ export default function WorkerScan() {
     try {
       if (timesDamaged > 0) {
         for (let i = 0; i < timesDamaged; i++) {
-          const res = await postScanIncrement(it.barcode, "damaged");
+          const res = await postScanIncrement(inputForScan, "damaged");
           if (res?.item) applyServerItemToLocal(res.item);
         }
         showToast(`${L("破损", "Daño")} +${timesDamaged}`);
       } else {
-        const res = await postScanIncrement(it.barcode, "good");
+        const res = await postScanIncrement(inputForScan, "good");
         if (res?.item) applyServerItemToLocal(res.item);
       }
     } catch {
@@ -477,7 +481,6 @@ export default function WorkerScan() {
       return hay.includes(kw);
     });
 
-    // ✅ 排序：状态优先，其次“最近扫码(lastCheckedAt)置顶”，最后 SKU
     list = list.sort((a, b) => {
       const sa = itemStatus(a);
       const sb = itemStatus(b);
@@ -660,7 +663,15 @@ export default function WorkerScan() {
           >
             <video
               ref={videoRef}
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", display: "block", background: "#F4F6FA" }}
+              style={{
+                position: "absolute",
+                inset: 0,
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+                display: "block",
+                background: "#F4F6FA",
+              }}
               className={camOn ? "opacity-100" : "opacity-0"}
               muted
               playsInline
@@ -847,7 +858,6 @@ export default function WorkerScan() {
                       </div>
                     </div>
 
-                    {/* ✅ 6 格：应验/良品/破损/相差/超收/证据 */}
                     <div className="mt-3 grid grid-cols-6 gap-2">
                       <StatSquare label={L("应验", "Esperado")} value={expected} />
                       <StatSquare label={L("良品", "Bueno")} value={good} />
@@ -931,14 +941,8 @@ export default function WorkerScan() {
                     await createExtraArrival(b, m);
                     showToast(L("已登记异常到货", "Registrado"));
                     setExtraAsk(null);
-                  } catch (e: any) {
-                    const msg = String(e?.message || "");
-                    // 如果后端还没做 /extras，这里一般会 404
-                    if (String(e?.status || "").startsWith("404") || msg.includes("404") || msg.includes("NOT_FOUND")) {
-                      showToast(L("后端未启用异常到货接口", "API extra no listo"));
-                    } else {
-                      showToast(L("登记失败", "Error"));
-                    }
+                  } catch {
+                    showToast(L("登记失败", "Error"));
                   } finally {
                     setExtraSubmitting(false);
                     setTimeout(() => scanInputRef.current?.focus(), 0);
